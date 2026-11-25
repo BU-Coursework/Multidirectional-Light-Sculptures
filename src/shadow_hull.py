@@ -68,7 +68,7 @@ def _local_bridge(a, b, voxel_centers, sources, weights, covered, connected):
 
 def connect_all_components_fast(
     hull, min_component_size=1, verbose=False, *, voxel_centers, sources,
-    max_added_shadow_fraction=0.08,
+    max_added_shadow_fraction=0.08, bridge_radius=0,
 ):
     hull = hull.copy()
     labels, count = connected_components_3d(hull)
@@ -103,6 +103,13 @@ def connect_all_components_fast(
         i = np.argmin(distance)
         path = _local_bridge(main_points[nearest[i]], points[i], voxel_centers,
                              sources, weights, covered, connected)
+        if bridge_radius:
+            offsets = np.argwhere(generate_binary_structure(3, 1)) - 1
+            expanded = path
+            for _ in range(bridge_radius):
+                expanded = np.unique((expanded[:, None] + offsets).reshape(-1, 3), axis=0)
+            inside = ((expanded >= 0) & (expanded < hull.shape)).all(axis=1)
+            path = expanded[inside]
         # A bridge can also connect a neighboring component along its route.
         neighbors = np.clip(path[:, None, :] + neighbor_offsets, 0, np.array(hull.shape) - 1)
         touched = set(np.unique(labels[tuple(neighbors.reshape(-1, 3).T)])) - attached - {0, component}
@@ -130,7 +137,7 @@ def connect_all_components_fast(
 
 def compute_shadow_hull(
     sources, voxel_centers, enforce_connectivity=True, min_component_size=1,
-    verbose=False, *, original_sources=None, projections=None,
+    verbose=False, *, original_sources=None, projections=None, bridge_radius=0,
 ):
     hull = compute_raw_shadow_hull(sources, voxel_centers, projections)
     if not enforce_connectivity:
@@ -138,4 +145,5 @@ def compute_shadow_hull(
     return connect_all_components_fast(
         hull, min_component_size=min_component_size, verbose=verbose, voxel_centers=voxel_centers,
         sources=sources if original_sources is None else original_sources,
+        bridge_radius=bridge_radius,
     )

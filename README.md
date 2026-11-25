@@ -15,6 +15,7 @@ The multidirectional light sculpture generation pipeline takes as input one to t
 - [Pipeline Stages](#pipeline-stages)
 - [Important Parameters](#important-parameters)
 - [Output Files](#output-files)
+- [Candidate selection and physical checks](#candidate-selection-and-physical-checks)
 - [Known Limitations](#known-limitations)
 - [Future Improvements](#future-improvements)
 
@@ -182,9 +183,29 @@ The pipeline generates:
 - `outputs/meshes/shadow_hull.stl`
 - STL shadow simulation images per view, with missing and extra pixels compared to the original masks
 - `fit_diagnostics.json` with per-view counts for sampling, silhouette conflicts, and connectivity losses
-- Debug silhouette masks
-- Debug voxel slice images
+- `candidate_quality.json` with the selected light setup, per-view IoU, thin-feature recall, hole preservation, STL volume, and connected core width. Non-dominated alternatives can be downloaded in the app.
+- Debug silhouette masks and voxel slices
 - Metrics printed to the terminal
+
+## Candidate selection and physical checks
+
+By default, the pipeline projects several STL candidates using the original masks. It weights mean overlap, the weakest view, and preservation of thin features and holes. Candidate geometry can vary by mask edit, pruning level, bridge width, or area sampling when the mask resolution exceeds the voxel grid. The reported connected core width is an erosion-based estimate capped at seven voxels. Printer tolerances and the actual minimum wall or bridge thickness need separate verification.
+
+Add `--search-alignment` to try small frame offsets and scale changes. Add `--search-light-angles` when the lights can move. Both keep view 1 fixed and leave the input pixels unchanged. The reported direction, up vector, frame center, and frame size describe the setup for each selected shadow. The CLI flag `--bridge-diameter-voxels 5` tries a wider bridge alternative, and `--center-ranking` reproduces the prior voxel-ranked selection.
+
+Run the generated holdouts from the repository root.
+
+```bash
+python scripts/benchmark_shadow_quality.py --output outputs/holdout
+```
+
+For a physical check, start with the three-view holdout and export the selected STL. Use the selected setup in `candidate_quality.json` to orient the object and lights. Mark the four corners of each predicted frame on a flat, light screen. Lock the camera exposure and position, then photograph each view with only its corresponding light on and the four marks visible. The marks should sit just outside the shadow area. Compare the dark photographed shadow to the pipeline’s white-on-black `*_actual.png`.
+
+```bash
+python scripts/compare_physical_shadow.py path/to/hull_view0_actual.png path/to/view0.jpg --corner 110,80 --corner 760,93 --corner 735,710 --corner 98,690 --threshold 128 --output outputs/physical-view0
+```
+
+Use your photo’s corner coordinates in clockwise order from the top left. The tool writes a registered photo, binary observed shadow, error overlay, and JSON metrics. Supply `--target path/to/hull_view0_target.png` to also score the photographed shadow against the intended silhouette.
 
 ## Known Limitations
 

@@ -224,7 +224,8 @@ def optimize_silhouettes(
     plateau_patience=2,
     fallback_growth_threshold=5,
     fallback_global_dilation=True,
-    verbose=True
+    verbose=True,
+    on_candidate=None,
 ):
     """Propose limited mask growth and keep the best connected original shadow."""
     current_sources = list(sources)
@@ -251,6 +252,8 @@ def optimize_silhouettes(
             for src, actual, weight in zip(sources, actuals, weights)
         ]
         score = .75 * float(np.mean(scores)) + .25 * min(scores)
+        if on_candidate is not None and it > 0 and hull.any():
+            on_candidate(score, current_sources)
         if score > best_score:
             best_score = score
             best_sources = list(current_sources)

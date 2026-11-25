@@ -385,6 +385,7 @@ def show_results(result, optimize_material):
     sim_dir = Path(result["output_dir"]) / "sim"
     show_carved = optimize_material and result["carved_stl_path"]
     prefix = "carved" if show_carved else "hull"
+    quality = result.get("candidate_quality")
 
     st.subheader("3. Preview")
 
@@ -392,6 +393,8 @@ def show_results(result, optimize_material):
 
     with preview_col:
         actual_images = sorted(sim_dir.glob(f"{prefix}_view*_actual.png"), key=get_view_number)
+        if quality and quality["selected_adjusted_setup"]:
+            actual_images = []
         show_stl_preview(final_stl_path, actual_images, result.get("world_size"), result.get("voxel_pitch"))
 
     with info_col:
@@ -400,8 +403,7 @@ def show_results(result, optimize_material):
         fit = result.get("fit_diagnostics")
         if fit:
             for first, second in fit.get("disjoint_view_pairs", []):
-                st.caption(f"Original views {first} and {second} share no voxel volume. "
-                           "The result uses limited silhouette edits.")
+                st.caption(f"Views {first} and {second} shared no voxel volume before setup or mask adjustments.")
         show_shadow_stats(summaries, fit)
 
         st.markdown("### Download")
@@ -414,6 +416,44 @@ def show_results(result, optimize_material):
                 mime="model/stl",
                 type="primary",
             )
+
+    if quality:
+        with st.expander("Compare sculpture candidates"):
+            selected = quality["selected"]
+            items = quality["candidates"]
+            rows = [{
+                "Candidate": item["name"], "Selected hull": i == selected,
+                "Mean IoU": f"{item['mean_iou']:.1%}", "Worst view": f"{item['worst_iou']:.1%}",
+                "Mesh volume (mm³)": round(item["mesh_volume"], 3),
+                "Connected core width (mm)": round(item["connected_core_width"], 3),
+            } for i, item in enumerate(items)]
+            st.table(rows)
+            st.caption("Core width is a voxel erosion estimate, capped at seven voxels. "
+                       "The table compares solid hulls before optional hollowing.")
+            search = quality.get("setup_search")
+            if search:
+                st.caption(f"Coarse setup coverage {search['coarse_before']:.1%} → "
+                           f"{search['coarse_after']:.1%}. "
+                           f"Selected setup: {'adjusted' if quality['selected_adjusted_setup'] else 'original'}.")
+                st.table([{
+                    "View": i + 1, "Horizontal": f"{view['horizontal']:.0%}",
+                    "Vertical": f"{view['vertical']:.0%}", "Frame scale": f"{view['scale']:.0%}",
+                    "Yaw": f"{view['yaw']}°", "Pitch": f"{view['pitch']}°",
+                } for i, view in enumerate(search["views"])])
+            st.download_button("Download candidate metrics and light setup",
+                               (Path(result["output_dir"]) / "candidate_quality.json").read_bytes(),
+                               file_name="candidate_quality.json", mime="application/json")
+            alternates = {item["name"]: item for item in items if item.get("sim_dir")}
+            if alternates:
+                name = st.selectbox("Alternate shadow preview", list(alternates))
+                paths = sorted(Path(alternates[name]["sim_dir"]).glob("hull_view*_actual.png"), key=get_view_number)
+                for i, (column, path) in enumerate(zip(st.columns(len(paths)), paths)):
+                    column.image(str(path), caption=f"View {i + 1}")
+            for i, item in enumerate(items):
+                if item.get("stl_path"):
+                    path = Path(item["stl_path"])
+                    st.download_button(f"Download {item['name']}", path.read_bytes(),
+                                       file_name=path.name, key=f"candidate_stl_{i}")
 
     st.subheader("4. Output previews")
 
@@ -525,6 +565,14 @@ with st.sidebar:
         value=False,
         help="Removes unnecessary interior voxels to create a hollow structure. Reduces material usage but increases processing time.",
     )
+    with st.expander("Candidate search"):
+        search_alignment = st.checkbox("Search silhouette alignment",
+                                       help="Allow small offsets and frame scale changes after the first view.")
+        search_light_angles = st.checkbox("Search light angles",
+                                          help="Enable when the installation can use different light directions.")
+        bridge_diameter_voxels = st.selectbox("Alternate bridge diameter", (1, 3, 5), index=1,
+                                              format_func=lambda value: f"{value} voxel" + ("s" if value > 1 else ""),
+                                              help="Generate an alternate route with this width when possible.")
 
 st.subheader("1. Choose silhouettes")
 
@@ -613,6 +661,9 @@ if run_clicked:
                         image_size_value=image_size,
                         optimize_material=optimize_material,
                         prune_passes=prune_passes,
+                        search_alignment=search_alignment,
+                        search_light_angles=search_light_angles,
+                        bridge_diameter_voxels=bridge_diameter_voxels,
                         log=ui_log,
                     )
 
