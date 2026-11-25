@@ -53,7 +53,7 @@ def add_wall_border(plotter, wall, color="#333333", line_width=0.035):
     plotter.add_mesh(tubes, color=color, lighting=False)
  
  
-def make_shadow_texture(mask_path: str, output_path: str, threshold: int = 128):
+def make_shadow_texture(mask_path: str, output_path: str, threshold: int = 128, *, white_shadow=False):
     img = Image.open(mask_path).convert("RGBA")
     arr = np.array(img)
 
@@ -64,8 +64,7 @@ def make_shadow_texture(mask_path: str, output_path: str, threshold: int = 128):
         0.114 * rgb[:, :, 2]
     )
 
-    # Dark pixels = the silhouette = the shadow
-    shadow_mask = luminance < threshold
+    shadow_mask = luminance >= threshold if white_shadow else luminance < threshold
 
     out = np.zeros((arr.shape[0], arr.shape[1], 4), dtype=np.uint8)
     out[:, :, 3] = shadow_mask.astype(np.uint8) * 200  
@@ -101,6 +100,9 @@ def render_shadow_preview(
     output_path: str,
     shadow_images=None,
     window_size=(1200, 900),
+    *,
+    world_size=None,
+    voxel_pitch=None,
 ):
     stl_path = str(stl_path)
     output_path = str(output_path)
@@ -108,15 +110,22 @@ def render_shadow_preview(
     plotter = pv.Plotter(off_screen=True, window_size=window_size)
     plotter.set_background("#393939")
 
-    mesh = pv.read(stl_path)
-    mesh = normalize_mesh(mesh, target_size=1.6)
-
     room_size = 5.0
     wall_height = 5.0
     half = room_size / 2.0
     eps = 0.01
     floor_z = -1.2
     wall_center_z = floor_z + wall_height / 2.0
+    mesh = pv.read(stl_path)
+    use_pipeline_shadows = shadow_images is not None
+    use_pipeline_scale = use_pipeline_shadows and world_size is not None and voxel_pitch is not None
+    if use_pipeline_scale:
+        mesh.translate(np.full(3, (voxel_pitch - world_size) / 2), inplace=True)
+        mesh.scale((room_size * 0.6) / world_size, inplace=True)
+        mesh.rotate_x(90, inplace=True)
+        mesh.translate((0, 0, wall_center_z), inplace=True)
+    else:
+        mesh = normalize_mesh(mesh, target_size=1.6)
 
     walls = [
         {
@@ -142,15 +151,12 @@ def render_shadow_preview(
         },
     ]
 
-    generated_shadows = []
-    for wall_cfg in walls:
-        tmp_silhouette = render_orthographic_silhouette(mesh, wall_cfg["direction"])
-        generated_shadows.append(tmp_silhouette)
-
-    mesh.translate(
-        (-mesh.center[0], -mesh.center[1], wall_center_z - mesh.center[2]),
-        inplace=True,
-    )
+    if use_pipeline_shadows:
+        generated_shadows = shadow_images
+    else:
+        generated_shadows = [render_orthographic_silhouette(mesh, wall["direction"]) for wall in walls]
+    if not use_pipeline_scale:
+        mesh.translate((-mesh.center[0], -mesh.center[1], wall_center_z - mesh.center[2]), inplace=True)
     plotter.add_mesh(mesh, color="#a3a3a3", smooth_shading=True, specular=0.15, diffuse=0.85)
 
     for wall_cfg in walls:
@@ -167,12 +173,16 @@ def render_shadow_preview(
     with tempfile.TemporaryDirectory() as tmpdir:
         for i, (mask_path, wall_cfg) in enumerate(zip(generated_shadows, walls)):
             shadow_png = Path(tmpdir) / f"shadow_{i}.png"
-            make_shadow_texture(mask_path, shadow_png, threshold=128)
+            make_shadow_texture(mask_path, shadow_png, threshold=128, white_shadow=use_pipeline_shadows)
+
+            u, v = wall_cfg["u"], wall_cfg["v"]
+            if use_pipeline_shadows and wall_cfg["direction"] == "top":
+                u, v = (-1, 0, 0), (0, -1, 0)
 
             decal = make_wall(
                 center=wall_cfg["decal_center"],
-                u_vec=wall_cfg["u"],
-                v_vec=wall_cfg["v"],
+                u_vec=u,
+                v_vec=v,
                 width=wall_cfg["width"] * 0.6,
                 height=wall_cfg["height"] * 0.6,
             )
@@ -185,11 +195,12 @@ def render_shadow_preview(
     plotter.enable_anti_aliasing()
     plotter.screenshot(output_path)
 
-    for p in generated_shadows:
-        try:
-            os.remove(p)
-        except OSError:
-            pass
+    if not use_pipeline_shadows:
+        for p in generated_shadows:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     plotter.close()
     return output_path

@@ -1,150 +1,141 @@
 import numpy as np
-from scipy.ndimage import label
+from scipy.ndimage import find_objects, generate_binary_structure, label
 from scipy.spatial import cKDTree
+from skimage.graph import MCP
 
-from projections import project_points_orthographic
+from distances import silhouette_weights
+from projections import pixel_indices, projected_mask
 
 
-def compute_raw_shadow_hull(sources, voxel_centers):
-    #     keep a voxel only if it projects inside EVERY silhouette.
-    nx, ny, nz, _ = voxel_centers.shape
-    pts = voxel_centers.reshape(-1, 3)
+FACE_NEIGHBORS = generate_binary_structure(3, 1)
 
-    keep = np.ones(len(pts), dtype=bool)
 
-    for src in sources:
-        px, py, valid, _ = project_points_orthographic(
-            pts,
-            src.direction,
-            src.up,
-            src.world_center,
-            src.world_size,
-            src.image.shape
-        )
-
-        pxi = np.clip(np.round(px).astype(int), 0, src.image.shape[1] - 1)
-        pyi = np.clip(np.round(py).astype(int), 0, src.image.shape[0] - 1)
-
-        inside = np.zeros(len(pts), dtype=bool)
-        inside[valid] = src.image[pyi[valid], pxi[valid]]
-
-        keep &= inside
-
-    return keep.reshape(nx, ny, nz)
+def compute_raw_shadow_hull(sources, voxel_centers, projections=None):
+    points = voxel_centers.reshape(-1, 3)
+    if projections is None:
+        projections = (pixel_indices(points, src) for src in sources)
+    keep = np.ones(len(points), dtype=bool)
+    for src, ids in zip(sources, projections):
+        keep &= (ids >= 0) & src.image.ravel()[np.maximum(ids, 0)]
+    return keep.reshape(voxel_centers.shape[:3])
 
 
 def connected_components_3d(mask):
-    # 6-connected components in 3D:
-    structure = np.zeros((3, 3, 3), dtype=bool)
-    structure[1, 1, 1] = True
-
-    structure[0, 1, 1] = True  # -x
-    structure[2, 1, 1] = True  # +x
-    structure[1, 0, 1] = True  # -y
-    structure[1, 2, 1] = True  # +y
-    structure[1, 1, 0] = True  # -z
-    structure[1, 1, 2] = True  # +z
-
-    labels, num = label(mask, structure=structure)
-    return labels, num
+    return label(mask, structure=FACE_NEIGHBORS)
 
 
-def line3d_voxels(p0, p1):
-    # Straight voxel line between two 3D integer points.
-    p0 = np.asarray(p0, dtype=float)
-    p1 = np.asarray(p1, dtype=float)
+def preferred_component(labels, count, voxel_centers, sources):
+    """Prefer a component that projects more of the original target detail."""
+    occupied = labels > 0
+    components = labels[occupied].astype(np.int64)
+    sizes = np.bincount(components, minlength=count + 1)
+    points = voxel_centers[occupied]
+    scores = np.zeros(count + 1)
+    for src in sources:
+        ids = pixel_indices(points, src)
+        valid = ids >= 0
+        size = src.image.size
+        hits = np.unique(components[valid] * size + ids[valid])
+        regions, pixels = np.divmod(hits, size)
+        target = src.image.ravel()
+        weights = silhouette_weights(src.image).ravel()
+        overlap = np.bincount(regions[target[pixels]], weights[pixels[target[pixels]]], minlength=count + 1)
+        extra = np.bincount(regions[~target[pixels]], weights[pixels[~target[pixels]]], minlength=count + 1)
+        scores += overlap / np.maximum(weights[target].sum() + extra, 1)
+    return int(np.lexsort((sizes[1:], scores[1:]))[-1] + 1)
 
-    n = int(np.max(np.abs(p1 - p0))) + 1
-    pts = np.round(np.linspace(p0, p1, n)).astype(int)
 
-    out = []
-    seen = set()
-    for p in pts:
-        key = tuple(p.tolist())
-        if key not in seen:
-            seen.add(key)
-            out.append(p)
-    return np.array(out, dtype=int)
+def _local_bridge(a, b, voxel_centers, sources, weights, covered, connected):
+    """Find a face-connected route near a closest pair of component voxels."""
+    margin = 8
+    lo = np.maximum(np.minimum(a, b) - margin, 0)
+    hi = np.minimum(np.maximum(a, b) + margin + 1, connected.shape)
+    area = tuple(slice(low, high) for low, high in zip(lo, hi))
+    points = voxel_centers[area].reshape(-1, 3)
+    cost = np.ones(len(points), dtype=np.float32)
+    for src, weight, coverage in zip(sources, weights, covered):
+        ids = pixel_indices(points, src)
+        pixels = np.maximum(ids, 0)
+        unwanted = (ids >= 0) & ~coverage[pixels] & ~src.image.ravel()[pixels]
+        cost += np.where(ids < 0, 6, np.where(unwanted, 6 * weight[pixels], 0))
+    cost = cost.reshape(tuple(hi - lo))
+    cost[connected[area]] = 0.1
+    solver = MCP(cost, fully_connected=False)
+    start, end = tuple(a - lo), tuple(b - lo)
+    solver.find_costs([start], [end])
+    return np.asarray(solver.traceback(end)) + lo
 
 
-def connect_all_components_fast(hull, min_component_size=1, verbose=False):
+def connect_all_components_fast(
+    hull, min_component_size=1, verbose=False, *, voxel_centers, sources,
+    max_added_shadow_fraction=0.08,
+):
     hull = hull.copy()
-
-    labels, num = connected_components_3d(hull)
-    if num <= 1:
+    labels, count = connected_components_3d(hull)
+    if count <= 1:
         return hull
+    main = preferred_component(labels, count, voxel_centers, sources)
+    connected = labels == main
+    main_points = np.argwhere(connected)
+    tree = cKDTree(main_points)
+    weights = [silhouette_weights(src.image).ravel() for src in sources]
+    covered = [
+        projected_mask(pixel_indices(voxel_centers[connected], src), src.image.shape).ravel()
+        for src in sources
+    ]
+    budgets = [max(2, int(src.image.sum() * max_added_shadow_fraction)) for src in sources]
+    sizes = np.bincount(labels.ravel())
+    boxes = find_objects(labels)
+    components = np.argsort(-sizes[1:], kind="stable") + 1
+    attached = {main}
+    neighbor_offsets = np.argwhere(FACE_NEIGHBORS) - 1
 
-    counts = np.bincount(labels.ravel())
-    counts[0] = 0  # ignore background
+    def component_points(component):
+        box = boxes[component - 1]
+        offset = np.array([axis.start for axis in box])
+        return np.argwhere(labels[box] == component) + offset
 
-    main_label = int(np.argmax(counts))
-    main_pts = np.argwhere(labels == main_label)
-
-    if len(main_pts) == 0:
-        return hull
-
-    main_tree = cKDTree(main_pts)
-
-    nx, ny, nz = hull.shape
-
-    for lab in range(1, num + 1):
-        if lab == main_label:
+    for component in components:
+        if component in attached or sizes[component] < min_component_size:
             continue
+        points = component_points(component)
+        distance, nearest = tree.query(points)
+        i = np.argmin(distance)
+        path = _local_bridge(main_points[nearest[i]], points[i], voxel_centers,
+                             sources, weights, covered, connected)
+        # A bridge can also connect a neighboring component along its route.
+        neighbors = np.clip(path[:, None, :] + neighbor_offsets, 0, np.array(hull.shape) - 1)
+        touched = set(np.unique(labels[tuple(neighbors.reshape(-1, 3).T)])) - attached - {0, component}
+        attachment = np.vstack((path, points, *(component_points(k) for k in sorted(touched))))
 
-        comp_size = int(counts[lab])
-        if comp_size < min_component_size:
-            continue
-
-        comp_pts = np.argwhere(labels == lab)
-        if len(comp_pts) == 0:
-            continue
-
-        # Find closest point in main component for each point in this component
-        dists, idxs = main_tree.query(comp_pts, k=1)
-
-        best_i = int(np.argmin(dists))
-        pb = comp_pts[best_i]          # point in floating component
-        pa = main_pts[idxs[best_i]]    # closest point in main component
-
-        path = line3d_voxels(pa, pb)
-
-        if verbose:
-            print(
-                f"[SHADOW HULL] connecting component {lab} "
-                f"(size={comp_size}) with bridge length {len(path)}"
-            )
-
-        path = path[
-            (path[:, 0] >= 0) & (path[:, 0] < nx) &
-            (path[:, 1] >= 0) & (path[:, 1] < ny) &
-            (path[:, 2] >= 0) & (path[:, 2] < nz)
+        # Count distinct new background pixels from the entire attachment.
+        added_points = voxel_centers[tuple(attachment.T)]
+        added = [np.unique(ids[ids >= 0]) for ids in (pixel_indices(added_points, src) for src in sources)]
+        new_extra = [
+            int((~coverage[pixels] & ~src.image.ravel()[pixels]).sum())
+            for coverage, pixels, src in zip(covered, added, sources)
         ]
-
-        hull[path[:, 0], path[:, 1], path[:, 2]] = True
-
+        if any(extra > budget for extra, budget in zip(new_extra, budgets)):
+            continue
+        hull[tuple(path.T)] = True
+        connected[tuple(attachment.T)] = True
+        attached.update(touched | {component})
+        for i, pixels in enumerate(added):
+            covered[i][pixels] = True
+            budgets[i] -= new_extra[i]
+        if verbose:
+            print(f"[SHADOW HULL] connected component {component}, new extra pixels per view: {new_extra}")
     return hull
 
 
 def compute_shadow_hull(
-    sources,
-    voxel_centers,
-    enforce_connectivity=True,
-    min_component_size=1,
-    verbose=False,
+    sources, voxel_centers, enforce_connectivity=True, min_component_size=1,
+    verbose=False, *, original_sources=None, projections=None,
 ):
-    hull = compute_raw_shadow_hull(sources, voxel_centers)
-
-    if not enforce_connectivity or not np.any(hull):
+    hull = compute_raw_shadow_hull(sources, voxel_centers, projections)
+    if not enforce_connectivity:
         return hull
-
-    labels, num = connected_components_3d(hull)
-    if num <= 1:
-        return hull
-
-    hull = connect_all_components_fast(
-        hull,
-        min_component_size=min_component_size,
-        verbose=verbose,
+    return connect_all_components_fast(
+        hull, min_component_size=min_component_size, verbose=verbose, voxel_centers=voxel_centers,
+        sources=sources if original_sources is None else original_sources,
     )
-
-    return hull

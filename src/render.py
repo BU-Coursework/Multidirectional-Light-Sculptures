@@ -1,26 +1,38 @@
 import numpy as np
-from projections import project_points_orthographic
+from projections import pixel_indices, project_points_orthographic, projected_mask
 
 def render_shadow(voxels, voxel_centers, src):
-    # pixel is True if any occupied voxel projects to it
-    pts = voxel_centers[voxels].reshape(-1, 3)
-    H, W = src.image.shape
-    out = np.zeros((H, W), dtype=bool)
+    return projected_mask(pixel_indices(voxel_centers[voxels], src), src.image.shape)
 
-    if len(pts) == 0:
-        return out
 
-    px, py, valid, _ = project_points_orthographic(
-        pts,
-        src.direction,
-        src.up,
-        src.world_center,
-        src.world_size,
-        src.image.shape
+def render_mesh_shadow(triangles, source):
+    """Rasterize projected STL triangles at the target image's pixel centers."""
+    height, width = source.image.shape
+    x, y, _, _ = project_points_orthographic(
+        triangles.reshape(-1, 3), source.direction, source.up,
+        source.world_center, source.world_size, source.image.shape,
     )
-
-    pxi = np.clip(np.round(px).astype(int), 0, W - 1)
-    pyi = np.clip(np.round(py).astype(int), 0, H - 1)
-
-    out[pyi[valid], pxi[valid]] = True
-    return out
+    x, y = x.reshape(-1, 3), y.reshape(-1, 3)
+    tolerance = 1e-5
+    left = np.maximum(0, np.ceil(x.min(axis=1) - tolerance)).astype(int)
+    right = np.minimum(width - 1, np.floor(x.max(axis=1) + tolerance)).astype(int)
+    top = np.maximum(0, np.ceil(y.min(axis=1) - tolerance)).astype(int)
+    bottom = np.minimum(height - 1, np.floor(y.max(axis=1) + tolerance)).astype(int)
+    ax, bx, cx = x.T
+    ay, by, cy = y.T
+    area = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    drawable = (left <= right) & (top <= bottom) & (np.abs(area) > 1e-9)
+    shadow = np.zeros((height, width), dtype=bool)
+    if not drawable.any():
+        return shadow
+    ax, bx, cx, ay, by, cy, left, right, top, bottom, area = (
+        data[drawable] for data in (ax, bx, cx, ay, by, cy, left, right, top, bottom, area)
+    )
+    for dx in range((right - left).max() + 1):
+        for dy in range((bottom - top).max() + 1):
+            col, row = left + dx, top + dy
+            u = ((col - ax) * (cy - ay) - (row - ay) * (cx - ax)) / area
+            v = ((bx - ax) * (row - ay) - (by - ay) * (col - ax)) / area
+            hit = (col <= right) & (row <= bottom) & (u >= -tolerance) & (v >= -tolerance) & (u + v <= 1 + tolerance)
+            shadow[row[hit], col[hit]] = True
+    return shadow

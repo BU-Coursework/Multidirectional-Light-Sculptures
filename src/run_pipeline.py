@@ -1,20 +1,23 @@
 import argparse
+from itertools import combinations
 import numpy as np
 import time
 
 from image_io import load_binary_image, save_mask
 from voxel_ops import make_voxel_centers, voxel_pitch
-from shadow_hull import compute_shadow_hull
+from shadow_hull import compute_raw_shadow_hull, compute_shadow_hull, connected_components_3d
 from shadow_source import build_sources
 from export_mesh import export_voxels_to_stl
 from carve import carve_hollow_shell_strict
 from simulate import simulate_and_save
+from projections import pixel_indices, projected_mask
+from render import render_shadow
 from debug_slices import save_voxel_slices
 from optimize_consistency import optimize_silhouettes
 from postprocess_prune import fast_projection_prune
 from pathlib import Path
 from datetime import datetime
-import time
+import json
 import warnings
 warnings.filterwarnings("ignore", module="paramiko")
 
@@ -58,13 +61,13 @@ def make_run_output_dir(base_dir="outputs"):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Build a multi-view shadow sculpture from 2 or more silhouette images."
+        description="Build a shadow sculpture from one to three silhouette images."
     )
 
     parser.add_argument(
         "views",
         nargs="+",
-        help="2 or more silhouette image paths"
+        help="One to three silhouette image paths"
     )
 
     parser.add_argument(
@@ -84,8 +87,8 @@ def parse_args():
     parser.add_argument(
         "--image-size",
         type=int,
-        default=256,
-        help="Square size used to resize input silhouettes"
+        default=None,
+        help="Square size used to resize silhouette images (defaults to --grid)"
     )
 
     parser.add_argument(
@@ -132,27 +135,67 @@ def parse_args():
     parser.add_argument(
         "--opt-iters",
         type=int,
-        default=4,
+        default=6,
         help="Silhouette optimization iterations"
     )
 
     args = parser.parse_args()
 
-    if len(args.views) < 2:
-        parser.error("Please provide at least 2 silhouette images.")
+    if len(args.views) > 3:
+        parser.error("Please provide one to three silhouette images.")
 
     return args
+
+
+def assess_strict_hull(sources, voxel_centers):
+    points = voxel_centers.reshape(-1, 3)
+    projections = [pixel_indices(points, src) for src in sources]
+    raw = compute_raw_shadow_hull(sources, voxel_centers, projections)
+    views = []
+    for src, ids in zip(sources, projections):
+        reachable = projected_mask(ids, src.image.shape)
+        strict = projected_mask(ids[raw.ravel()], src.image.shape)
+        views.append({
+            "target_pixels": int(src.image.sum()),
+            "no_center_ray": int((src.image & ~reachable).sum()),
+            "blocked_by_other_views": int((src.image & reachable & ~strict).sum()),
+            "strict_coverage": int((src.image & strict).sum()),
+        })
+    disjoint_view_pairs = []
+    if len(sources) > 1 and not raw.any():
+        valid_masks = [
+            (ids >= 0) & src.image.ravel()[np.maximum(ids, 0)]
+            for src, ids in zip(sources, projections)
+        ]
+        disjoint_view_pairs = [
+            [i + 1, j + 1] for i, j in combinations(range(len(sources)), 2)
+            if not (valid_masks[i] & valid_masks[j]).any()
+        ]
+    return raw, {
+        "strict_voxels": int(raw.sum()), "disjoint_view_pairs": disjoint_view_pairs, "views": views,
+    }
+
+
+def mesh_triangles_in_world(mesh, world_size, pitch):
+    # STL stores index-space coordinates as float32, so match the exported geometry.
+    return mesh.triangles.astype(np.float32).astype(float) + (pitch - world_size) / 2
 
 
 def run_pipeline(
     view_paths,
     world_size=1.0,
     grid=120,
-    image_size_value=160,
+    image_size_value=None,
     optimize_material=False,
     output_dir=None,
     prune_passes=6,
     log=print,
+    directions=None,
+    opt_iters=6,
+    threshold=128,
+    close_iters=0,
+    open_iters=0,
+    dilate_iters=0,
 ):
     t0 = time.time()
 
@@ -175,19 +218,28 @@ def run_pipeline(
     log(f"[PIPELINE] output directory: {output_dir}")
 
     nx = ny = nz = grid
+    image_size_value = grid if image_size_value is None else image_size_value
     image_size = (image_size_value, image_size_value)
 
     images = []
     for i, path in enumerate(view_paths):
-        img = load_binary_image(path, size=image_size)
+        img = load_binary_image(path, size=image_size, threshold=threshold,
+                                close_iters=close_iters, open_iters=open_iters, dilate_iters=dilate_iters)
         images.append(img)
 
     for i, img in enumerate(images):
         save_mask(img, str(debug_dir / "masks" / "base" / f"view{i}_mask.png"))
 
-    sources = build_sources(images, world_size)
+    sources = build_sources(images, world_size, directions=directions)
     original_sources = sources
     voxel_centers = make_voxel_centers(nx, ny, nz, world_size)
+    strict, fit = assess_strict_hull(original_sources, voxel_centers)
+    for i, view in enumerate(fit["views"]):
+        log(f"[FIT] view {i + 1}: {view['no_center_ray']} pixels without a voxel-center ray, "
+            f"{view['blocked_by_other_views']} ruled out by other silhouettes")
+    for first, second in fit["disjoint_view_pairs"]:
+        log(f"[FIT] views {first} and {second} share no strict voxel volume. "
+            "Check mask placement and light directions if the edited result loses detail.")
 
     # optimize the input silhouettes if more than one inputted
     if len(sources) > 1:
@@ -196,7 +248,7 @@ def run_pipeline(
         optimized_sources = optimize_silhouettes(
             sources,
             voxel_centers,
-            iterations=6,
+            iterations=opt_iters,
             alpha=0.15,
             sigma=4.0,
             sample_per_view=300,
@@ -216,11 +268,12 @@ def run_pipeline(
         optimized_sources = sources
 
     log("[PIPELINE] computing shadow hull...")
-    hull = compute_shadow_hull(sources, voxel_centers)
+    hull = compute_shadow_hull(sources, voxel_centers, original_sources=original_sources)
 
     log(f"[PIPELINE] initial hull voxel count: {int(hull.sum())}")
     log(f"[PIPELINE] initial hull occupancy ratio: {float(hull.mean())}")
 
+    connected_hull = hull
     log("[PIPELINE] pruning hull...")
     hull, post_stats = fast_projection_prune(
         hull,
@@ -239,31 +292,40 @@ def run_pipeline(
     log(f"[PIPELINE] fast prune cc removed: {post_stats['cc_removed']}")
     log(f"[PIPELINE] fast prune final hull voxel count: {post_stats['final_voxels']}")
 
-    log("[PIPELINE] simulating shadows...")
-    hull_summaries = simulate_and_save(
-        hull,
-        voxel_centers,
-        sources,
-        out_dir=str(sim_dir),
-        prefix="hull",
-    )
+    for i, src in enumerate(original_sources):
+        strict_actual = render_shadow(strict, voxel_centers, src)
+        hull_actual = render_shadow(hull, voxel_centers, src)
+        bridged_actual = render_shadow(connected_hull, voxel_centers, src)
+        fit["views"][i].update(
+            lost_from_strict_hull=int((src.image & strict_actual & ~hull_actual).sum()),
+            lost_at_connectivity_cleanup=int((src.image & bridged_actual & ~hull_actual).sum()),
+        )
+    (output_dir / "fit_diagnostics.json").write_text(json.dumps(fit, indent=2), encoding="utf-8")
+    if not hull.any():
+        raise ValueError("The silhouettes leave no shared sculpture volume within the allowed edits. "
+                         "Check their alignment and light directions.")
 
     pitch = voxel_pitch(world_size, nx, ny, nz)
 
     hull_stl_path = str(mesh_dir / "shadow_hull.stl")
 
     log("[PIPELINE] exporting STL...")
-    export_voxels_to_stl(hull, pitch, hull_stl_path)
+    mesh = export_voxels_to_stl(hull, pitch, hull_stl_path)
     log(f"[PIPELINE] saved raw hull mesh: {hull_stl_path}")
+    hull_summaries = simulate_and_save(
+        hull, voxel_centers, original_sources, out_dir=str(sim_dir), prefix="hull",
+        triangles=mesh_triangles_in_world(mesh, world_size, pitch), edited_sources=optimized_sources,
+    )
 
     carved_stl_path = None
+    carved_summaries = None
 
     if optimize_material:
         log("[PIPELINE] carving material...")
-        carved, carve_stats = carve_hollow_shell_strict(
+        carved, _ = carve_hollow_shell_strict(
             hull,
             voxel_centers,
-            sources,
+            original_sources,
             shell_thickness_voxels=2,
             max_passes=4,
             random_seed=0,
@@ -273,46 +335,56 @@ def run_pipeline(
             verbose=True,
         )
 
-        log(f"[PIPELINE] carved sculpture voxels: {int(carved.sum())}")
+        if connected_components_3d(carved)[1] != 1:
+            log("[PIPELINE] hollowing would break face connectivity; keeping the solid sculpture")
+            carved = hull
+        carved_count = int(carved.sum())
+        hull_count = int(hull.sum())
+        log(f"[PIPELINE] carved sculpture voxels: {carved_count}")
         log(f"[PIPELINE] carved sculpture occupancy ratio: {float(carved.mean())}")
-        log(f"[PIPELINE] carved sculpture voxels removed: {carve_stats['removed']}")
-        log(f"[PIPELINE] carved sculpture reduction ratio: {carve_stats['reduction_ratio']}")
-
-        simulate_and_save(
-            carved,
-            voxel_centers,
-            sources,
-            out_dir="outputs/sim",
-            prefix="carved",
-        )
+        log(f"[PIPELINE] carved sculpture voxels removed: {hull_count - carved_count}")
+        log(f"[PIPELINE] carved sculpture reduction ratio: {1 - carved_count / hull_count}")
 
         save_voxel_slices(hull, str(debug_dir / "slices"), "hull")
         save_voxel_slices(carved, str(debug_dir / "slices"), "carved")
 
         carved_stl_path = str(mesh_dir / "shadow_carved.stl")
-        export_voxels_to_stl(carved, pitch, carved_stl_path)
+        carved_mesh = export_voxels_to_stl(carved, pitch, carved_stl_path)
+        carved_summaries = simulate_and_save(
+            carved, voxel_centers, original_sources, out_dir=str(sim_dir), prefix="carved",
+            triangles=mesh_triangles_in_world(carved_mesh, world_size, pitch), edited_sources=optimized_sources,
+        )
         log(f"[PIPELINE] saved carved mesh: {carved_stl_path}")
 
     log(f"[PIPELINE] completed in {time.time() - t0:.2f} seconds")
 
     return {
         "output_dir": str(output_dir),
+        "world_size": world_size,
+        "voxel_pitch": pitch,
         "hull_stl_path": hull_stl_path,
         "carved_stl_path": carved_stl_path,
         "hull_summaries": hull_summaries,
+        "carved_summaries": carved_summaries,
+        "fit_diagnostics": fit,
     }
 
 
 def main():
     args = parse_args()
 
-    run_pipeline(
+    result = run_pipeline(
         view_paths=args.views,
         world_size=args.world_size,
         grid=args.grid,
         image_size_value=args.image_size,
         optimize_material=args.optimize_material,
+        directions=parse_direction_string(args.directions) if args.directions else None,
+        opt_iters=args.opt_iters, threshold=args.threshold,
+        close_iters=args.close_iters, open_iters=args.open_iters, dilate_iters=args.dilate_iters,
     )
+    print_view_metrics("STL shadows against original silhouettes",
+                       result["carved_summaries"] or result["hull_summaries"])
 
 
 if __name__ == "__main__":

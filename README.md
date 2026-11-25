@@ -106,8 +106,8 @@ pip install -r requirements.txt
 
 Input silhouettes are be binary images where:
 
-- White pixels represent required shadow coverage
-- Black pixels represent empty shadow
+- Dark pixels represent required shadow coverage
+- Light pixels represent empty shadow
 
 You may attempt to use with non binary images; however, the conversion from non binary images to binary images may lose a lot of the detail in the image. For best results, choose input images with clear dark and light regions. For best consistency, choose input images that are similar sizes/shapes.
 
@@ -128,7 +128,7 @@ python src/run_pipeline.py inputs/view4.png inputs/view6.png --grid 96 --image-s
 ```
 
 The --grid, --image-size, --optimize-material, and --directions flags are optional.
-You must provide at least 2 silhouette images.
+Provide one to three silhouette images. By default, the CLI matches the mask resolution to the voxel grid.
 Custom directions should be given as semicolon-separated 3D vectors, one per input image.
 
 ## Running the Web UI (Streamlit App)
@@ -151,13 +151,12 @@ Alternatively, we have hosted the streamlit app. To access, click on this link:
 
 1. Load binary silhouette images as binary matrices
 2. Configure shadow sources and light directions
-3. Optimize silhouettes to reduce inconsistent shadow pixels between silhouettes
-4. Compute conservative shadow hull
-5. Prune redundant voxels and ensure single component constraint on structure
-6. Hollow out the sculpture
-7. Simulate hull shadows
-8. Export carved mesh as STL
-9. Save simulated shadow renders and debug slices to output run directory
+3. Check which original target pixels have a voxel-center ray and which rays the other silhouettes rule out
+4. Evaluate the strict hull and limited silhouette edits against the original masks, including thin features and holes
+5. Route needed connections and prune redundant voxels while preserving original shadow coverage and face connectivity
+6. Optionally hollow out the sculpture
+7. Export the STL and rasterize its projected triangles against the original masks
+8. Save shadow comparisons, fit diagnostics, and debug artifacts to the output run directory
 
 ## Important Parameters
 
@@ -181,7 +180,8 @@ Higher voxel resolution improves shadow accuracy but increases runtime and memor
 The pipeline generates:
 
 - `outputs/meshes/shadow_hull.stl`
-- Shadow simulation images per view
+- STL shadow simulation images per view, with missing and extra pixels compared to the original masks
+- `fit_diagnostics.json` with per-view counts for sampling, silhouette conflicts, and connectivity losses
 - Debug silhouette masks
 - Debug voxel slice images
 - Metrics printed to the terminal

@@ -40,17 +40,19 @@ class StreamlitLogCapture:
             self.log_func(self.buffer.strip())
             self.buffer = ""
             
-def show_stl_preview(stl_path):
+def show_stl_preview(stl_path, shadow_images, world_size, voxel_pitch):
     with tempfile.TemporaryDirectory() as tmpdir:
         output_path = str(Path(tmpdir) / "preview.png")
         render_shadow_preview(
             stl_path=stl_path,
             output_path=output_path,
-            shadow_images=[],
+            shadow_images=shadow_images,
+            world_size=world_size,
+            voxel_pitch=voxel_pitch,
         )
         st.image(output_path, use_container_width=True)
 
-def show_shadow_stats(hull_summaries):
+def show_shadow_stats(hull_summaries, fit_diagnostics=None):
     if not hull_summaries:
         st.info("No shadow stats available.")
         return
@@ -68,13 +70,21 @@ def show_shadow_stats(hull_summaries):
                     padding:10px;
                     background:#151922;
                 ">
-                    <div><b>Accuracy:</b> {m['iou'] * 100:.2f}%</div>
+                    <div><b>Original mask IoU:</b> {m['iou'] * 100:.2f}%</div>
                     <div><b>Missing:</b> {m['missing_pixels']}</div>
                     <div><b>Extra:</b> {m['extra_pixels']}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+            if m.get("optimizer_added_pixels"):
+                st.caption(f"Edited mask IoU {m['edited_target_iou']:.1%} · "
+                           f"{m['optimizer_added_pixels']:,} pixels added")
+            if fit_diagnostics:
+                view = fit_diagnostics["views"][i]
+                st.caption(f"{view['no_center_ray']:,} target pixels without a voxel-center ray · "
+                           f"{view['blocked_by_other_views']:,} blocked by the other views · "
+                           f"{view['lost_at_connectivity_cleanup']:,} lost during connectivity cleanup")
 
 
 def preview_uploaded_image_return(uploaded_file, image_size=250, threshold=128, invert=False):
@@ -373,19 +383,26 @@ def show_results(result, optimize_material):
     )
 
     sim_dir = Path(result["output_dir"]) / "sim"
+    show_carved = optimize_material and result["carved_stl_path"]
+    prefix = "carved" if show_carved else "hull"
 
     st.subheader("3. Preview")
 
     preview_col, info_col = st.columns([1.1, 1])
 
     with preview_col:
-        show_stl_preview(
-            final_stl_path
-        )
+        actual_images = sorted(sim_dir.glob(f"{prefix}_view*_actual.png"), key=get_view_number)
+        show_stl_preview(final_stl_path, actual_images, result.get("world_size"), result.get("voxel_pitch"))
 
     with info_col:
         st.markdown("### Result Stats")
-        show_shadow_stats(result.get("hull_summaries"))
+        summaries = result.get("carved_summaries") if show_carved else result.get("hull_summaries")
+        fit = result.get("fit_diagnostics")
+        if fit:
+            for first, second in fit.get("disjoint_view_pairs", []):
+                st.caption(f"Original views {first} and {second} share no voxel volume. "
+                           "The result uses limited silhouette edits.")
+        show_shadow_stats(summaries, fit)
 
         st.markdown("### Download")
 
@@ -401,7 +418,7 @@ def show_results(result, optimize_material):
     st.subheader("4. Output previews")
 
     if sim_dir.exists():
-        sim_images = list(sim_dir.glob("*.png"))
+        sim_images = list(sim_dir.glob(f"{prefix}_*.png"))
 
         if sim_images:
             grouped = {}
@@ -424,7 +441,7 @@ def show_results(result, optimize_material):
                         if "target" in name:
                             caption = "Target Silhouette (Input)"
                         elif "actual" in name:
-                            caption = "Rendered Silhouette"
+                            caption = "Exported STL Shadow"
                         elif "comparison" in name:
                             caption = "Comparison to Target"
                         elif "missing" in name:
