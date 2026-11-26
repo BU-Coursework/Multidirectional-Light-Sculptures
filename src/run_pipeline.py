@@ -16,6 +16,7 @@ from render import render_shadow
 from debug_slices import save_voxel_slices
 from optimize_consistency import optimize_silhouettes
 from postprocess_prune import fast_projection_prune
+from print_cleanup import mesh_shadows, shadow_regressions, trim_for_print
 from light_setup import search_light_setup
 from quality_candidates import (
     SculptureCandidate, footprint_sampled_masks, measure_candidate, select_candidate, tradeoff_options,
@@ -151,6 +152,8 @@ def parse_args():
                         help="Try bounded light angle changes for views after the first")
     parser.add_argument("--bridge-diameter-voxels", type=int, choices=(1, 3, 5), default=3,
                         help="Diameter of the optional thicker-bridge candidate")
+    parser.add_argument("--no-print-cleanup", action="store_true",
+                        help="Keep the selected hull without trimming thin geometry")
 
     args = parser.parse_args()
 
@@ -222,6 +225,7 @@ def run_pipeline(
     search_alignment=False,
     search_light_angles=False,
     bridge_diameter_voxels=3,
+    print_cleanup=True,
 ):
     t0 = time.time()
 
@@ -351,6 +355,27 @@ def run_pipeline(
         raise ValueError("The silhouettes leave no shared sculpture volume within the allowed edits. "
                          "Check their alignment and light directions.")
     chosen = select_candidate(measured)
+    cleanup = {"enabled": rank_stl and print_cleanup, "applied": False}
+    untrimmed = None
+    if cleanup["enabled"]:
+        base = accepted[chosen]
+        trimmed = trim_for_print(base.hull, voxel_centers, base.targets, meshes[chosen], world_size, pitch)
+        if trimmed is not None:
+            voxels, mesh, stats = trimmed
+            cleaned = SculptureCandidate("Print cleanup", voxels, base.bridged, base.targets,
+                                          base.edited, base.pruning, base.adjusted_setup)
+            metrics, mesh = measure_candidate(cleaned, world_size, pitch, mesh=mesh)
+            if (metrics["connected_core_width"] >= measured[chosen]["connected_core_width"]
+                    and metrics["mesh_volume"] < measured[chosen]["mesh_volume"]):
+                untrimmed = chosen
+                chosen = len(accepted)
+                accepted.append(cleaned)
+                measured.append(metrics)
+                meshes.append(mesh)
+                cleanup.update(stats, applied=True, original_candidate=untrimmed)
+                log(f"[PRINT] removed {stats['removed_voxels']:,} voxels with STL shadow protection")
+        if not cleanup["applied"]:
+            log("[PRINT] kept the selected geometry after cleanup checks")
     selected = accepted[chosen]
     hull, connected_hull = selected.hull, selected.bridged
     optimized_sources, target_sources = selected.edited, selected.targets
@@ -362,6 +387,8 @@ def run_pipeline(
             save_mask(src.image, str(debug_dir / "masks" / "opt" / f"view{i}_optimized_mask.png"))
     alternatives = set(tradeoff_options(measured, chosen))
     alternatives.update(i for i, option in enumerate(accepted) if option.adjusted_setup and i != chosen)
+    if untrimmed is not None:
+        alternatives.add(untrimmed)
     for i in sorted(alternatives):
         alternative = accepted[i]
         path = mesh_dir / f"alternative_{i + 1}.stl"
@@ -374,7 +401,8 @@ def run_pipeline(
                           triangles=mesh_triangles_in_world(meshes[i], world_size, pitch))
         measured[i]["sim_dir"] = str(alternative_sim)
     quality = {"selected": chosen, "candidates": measured, "selected_setup": selected_setup,
-               "setup_search": setup_search, "selected_adjusted_setup": selected.adjusted_setup}
+               "setup_search": setup_search, "selected_adjusted_setup": selected.adjusted_setup,
+               "print_cleanup": cleanup}
 
     for i, src in enumerate(target_sources):
         strict_actual = render_shadow(strict, voxel_centers, original_sources[i])
@@ -426,6 +454,10 @@ def run_pipeline(
             solid_metrics = measured[chosen]
             keep_hollow = (hollow_metrics["mean_iou"] >= solid_metrics["mean_iou"] - .005
                            and hollow_metrics["score"] >= solid_metrics["score"] - .005)
+            if keep_hollow and cleanup["applied"]:
+                before = mesh_shadows(mesh, target_sources, world_size, pitch)
+                after = mesh_shadows(hollow_mesh, target_sources, world_size, pitch)
+                keep_hollow = not any(mask.any() for mask in shadow_regressions(before, after, target_sources))
             quality["hollow"] = {"accepted": keep_hollow, "metrics": hollow_metrics}
             if keep_hollow:
                 carved_mesh = hollow_mesh
@@ -480,6 +512,7 @@ def main():
         close_iters=args.close_iters, open_iters=args.open_iters, dilate_iters=args.dilate_iters,
         rank_stl=not args.center_ranking, search_alignment=args.search_alignment,
         search_light_angles=args.search_light_angles, bridge_diameter_voxels=args.bridge_diameter_voxels,
+        print_cleanup=not args.no_print_cleanup,
     )
     print_view_metrics("STL shadows against original silhouettes",
                        result["carved_summaries"] or result["hull_summaries"])

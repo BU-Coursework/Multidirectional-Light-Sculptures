@@ -43,8 +43,9 @@ def connected_core_width(hull, pitch):
     return float(width)
 
 
-def measure_candidate(candidate, world_size, pitch):
-    mesh = mesh_from_voxels(candidate.hull, pitch)
+def measure_candidate(candidate, world_size, pitch, *, mesh=None):
+    if mesh is None:
+        mesh = mesh_from_voxels(candidate.hull, pitch)
     triangles = mesh_triangles_in_world(mesh, world_size, pitch)
     scores = []
     for source in candidate.targets:

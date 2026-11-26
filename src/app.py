@@ -430,6 +430,11 @@ def show_results(result, optimize_material):
             st.table(rows)
             st.caption("Core width is a voxel erosion estimate, capped at seven voxels. "
                        "The table compares solid hulls before optional hollowing.")
+            cleanup = quality.get("print_cleanup", {})
+            if cleanup.get("applied"):
+                st.caption(f"Print cleanup removed {cleanup['removed_voxels']:,} voxels and "
+                           f"{sum(cleanup['removed_extra_pixels']):,} extra shadow pixels while "
+                           "preserving the selected hull's target coverage.")
             search = quality.get("setup_search")
             if search:
                 st.caption(f"Coarse setup coverage {search['coarse_before']:.1%} → "
@@ -566,6 +571,8 @@ with st.sidebar:
         help="Removes unnecessary interior voxels to create a hollow structure. Reduces material usage but increases processing time.",
     )
     with st.expander("Candidate search"):
+        print_cleanup = st.checkbox("Trim thin features for printing", value=True,
+                                   help="Remove thin material when the sculpture stays connected and its STL shadows keep all correct detail.")
         search_alignment = st.checkbox("Search silhouette alignment",
                                        help="Allow small offsets and frame scale changes after the first view.")
         search_light_angles = st.checkbox("Search light angles",
@@ -664,6 +671,7 @@ if run_clicked:
                         search_alignment=search_alignment,
                         search_light_angles=search_light_angles,
                         bridge_diameter_voxels=bridge_diameter_voxels,
+                        print_cleanup=print_cleanup,
                         log=ui_log,
                     )
 

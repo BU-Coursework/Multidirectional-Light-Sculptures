@@ -193,6 +193,8 @@ By default, the pipeline projects several STL candidates using the original mask
 
 Add `--search-alignment` to try small frame offsets and scale changes. Add `--search-light-angles` when the lights can move. Both keep view 1 fixed and leave the input pixels unchanged. The reported direction, up vector, frame center, and frame size describe the setup for each selected shadow. The CLI flag `--bridge-diameter-voxels 5` tries a wider bridge alternative, and `--center-ranking` reproduces the prior voxel-ranked selection.
 
+Print cleanup runs by default after STL candidate selection. It trims thin features and restores connections or shadow coverage as needed. It keeps a trim only when the resulting STL stays connected and watertight, preserves every previously correct target pixel, adds no new off-target shadow, and preserves the core-width estimate. The untrimmed candidate remains available for comparison. Use `--no-print-cleanup` or clear **Trim thin features for printing** to bypass it. Check the selected STL in your slicer at the intended physical scale to evaluate overhangs and supports.
+
 Run the generated holdouts from the repository root.
 
 ```bash

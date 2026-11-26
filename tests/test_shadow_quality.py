@@ -10,9 +10,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from compare_physical_shadow import register_photo
+from export_mesh import mesh_from_voxels
 from light_setup import search_light_setup
 from optimize_consistency import optimize_silhouettes
 from postprocess_prune import fast_projection_prune
+from print_cleanup import mesh_shadows, shadow_regressions, trim_for_print
 from quality_candidates import connected_core_width, select_candidate, tradeoff_options
 from render import render_mesh_shadow, render_shadow
 from run_pipeline import assess_strict_hull, run_pipeline
@@ -147,6 +149,40 @@ class ShadowQualityTests(unittest.TestCase):
         np.testing.assert_array_equal(np.asarray(result), photo[5:13, 4:12])
         with self.assertRaisesRegex(ValueError, "clockwise"):
             register_photo(image, (8, 8), corners[::-1])
+
+    def test_print_cleanup_removes_hidden_strip_and_keeps_stl_shadow(self):
+        size = 20
+        centers = make_voxel_centers(size, size, size, size)
+        hull = np.zeros((size, size, size), dtype=bool)
+        hull[7:15, 5:13, 5:13] = True
+        hull[2:7, 8, 8] = True
+        sources = build_sources([hull.any(axis=0)[::-1, ::-1]], size)
+        mesh = mesh_from_voxels(hull, 1)
+        cleaned, cleaned_mesh, metrics = trim_for_print(hull, centers, sources, mesh, size, 1)
+        self.assertEqual(metrics["removed_voxels"], 5)
+        self.assertEqual(connected_components_3d(cleaned)[1], 1)
+        self.assertTrue(cleaned_mesh.is_watertight)
+        before = mesh_shadows(mesh, sources, size, 1)
+        after = mesh_shadows(cleaned_mesh, sources, size, 1)
+        np.testing.assert_array_equal(after, before)
+
+    def test_print_cleanup_keeps_thin_attachment_when_it_is_the_only_connection(self):
+        size = 24
+        centers = make_voxel_centers(size, size, size, size)
+        hull = np.zeros((size, size, size), dtype=bool)
+        hull[2:8, 5:13, 5:13] = True
+        hull[15:22, 5:13, 5:13] = True
+        hull[8:15, 8, 8] = True
+        sources = build_sources([hull.any(axis=0)[::-1, ::-1]], size)
+        self.assertIsNone(trim_for_print(hull, centers, sources, mesh_from_voxels(hull, 1), size, 1))
+
+    def test_stl_guard_detects_shadow_moves_even_when_pixel_counts_match(self):
+        target = np.array([[True, True], [False, False]])
+        before = np.array([[True, False], [True, False]])
+        after = np.array([[False, True], [False, True]])
+        sources = build_sources([target], 1)
+        regression, = shadow_regressions([before], [after], sources)
+        np.testing.assert_array_equal(regression, [[True, False], [False, True]])
 
 
 if __name__ == "__main__":
