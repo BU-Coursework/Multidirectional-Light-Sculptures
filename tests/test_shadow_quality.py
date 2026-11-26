@@ -16,7 +16,7 @@ from optimize_consistency import optimize_silhouettes
 from postprocess_prune import fast_projection_prune
 from print_cleanup import mesh_shadows, shadow_regressions, trim_for_print
 from quality_candidates import connected_core_width, select_candidate, tradeoff_options
-from render import render_mesh_shadow, render_shadow
+from render import doubled_shadow_source, render_mesh_shadow, render_shadow
 from run_pipeline import assess_strict_hull, run_pipeline
 from shadow_hull import compute_shadow_hull, connected_components_3d
 from shadow_source import build_sources
@@ -86,6 +86,28 @@ class ShadowQualityTests(unittest.TestCase):
         expected[2:7, 2:7] = True
         np.testing.assert_array_equal(render_mesh_shadow(triangles, source), expected)
 
+    def test_fine_mesh_samples_stay_inside_the_original_frame_cells(self):
+        mask = np.zeros((4, 4), dtype=bool)
+        mask[1, 1] = True
+        source, = build_sources([mask], 1)
+        corners = np.array([[0, 0, .25], [0, .25, .25], [0, .25, 0], [0, 0, 0]])
+        triangles = corners[[[0, 1, 2], [0, 2, 3]]]
+        fine = doubled_shadow_source(source)
+        np.testing.assert_array_equal(render_mesh_shadow(triangles, fine, cell_centers=True), fine.image)
+
+    def test_detail_aware_bridge_connects_diagonal_islands(self):
+        size = 20
+        mask = np.zeros((size, size), dtype=bool)
+        mask[4:9, 4:9] = True
+        mask[9:14, 9:14] = True
+        centers = make_voxel_centers(size, size, size, 1)
+        source, = build_sources([mask], 1)
+        hull = compute_shadow_hull([source], centers, detail_aware=True)
+        self.assertEqual(connected_components_3d(hull)[1], 1)
+        actual = render_shadow(hull, centers, source)
+        self.assertEqual((mask & ~actual).sum(), 0)
+        self.assertEqual((actual & ~mask).sum(), 1)
+
     def test_pipeline_reports_original_stl_shadow_at_mismatched_resolution(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -103,6 +125,8 @@ class ShadowQualityTests(unittest.TestCase):
             np.testing.assert_array_equal(preview, mask)
             quality = result["candidate_quality"]
             self.assertAlmostEqual(quality["candidates"][quality["selected"]]["mean_iou"], scores["iou"])
+            self.assertAlmostEqual(quality["candidates"][quality["selected"]]["mean_area_iou"], scores["area_iou"])
+            self.assertTrue((directory / "sim_area" / "hull_view0_comparison.png").is_file())
             self.assertTrue((directory / "candidate_quality.json").is_file())
 
     def test_setup_search_preserves_pixels_and_first_view(self):
@@ -129,6 +153,14 @@ class ShadowQualityTests(unittest.TestCase):
         ]
         self.assertEqual(select_candidate(candidates), 1)
         self.assertEqual(tradeoff_options(candidates, 1), [2])
+
+    def test_mesh_ranker_rejects_a_candidate_worse_on_both_sampling_grids(self):
+        candidates = [
+            {"mean_iou": .900, "mean_area_iou": .880, "score": .89, "mesh_volume": 10},
+            {"mean_iou": .902, "mean_area_iou": .884, "score": .88, "mesh_volume": 10},
+            {"mean_iou": .903, "mean_area_iou": .883, "score": .87, "mesh_volume": 10},
+        ]
+        self.assertEqual(select_candidate(candidates), 1)
 
     def test_core_width_detects_thin_connector(self):
         thin = np.zeros((24, 16, 16), dtype=bool)

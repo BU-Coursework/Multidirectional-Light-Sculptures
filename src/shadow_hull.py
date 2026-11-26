@@ -1,9 +1,9 @@
 import numpy as np
-from scipy.ndimage import find_objects, generate_binary_structure, label
+from scipy.ndimage import binary_erosion, find_objects, generate_binary_structure, label, maximum_filter
 from scipy.spatial import cKDTree
 from skimage.graph import MCP
 
-from distances import silhouette_weights
+from distances import shadow_detail_weights, silhouette_weights
 from projections import pixel_indices, projected_mask
 
 
@@ -45,9 +45,10 @@ def preferred_component(labels, count, voxel_centers, sources):
     return int(np.lexsort((sizes[1:], scores[1:]))[-1] + 1)
 
 
-def _local_bridge(a, b, voxel_centers, sources, weights, covered, connected):
+def _local_bridge(a, b, voxel_centers, sources, weights, covered, connected, *,
+                  endpoints=None, radius=0):
     """Find a face-connected route near a closest pair of component voxels."""
-    margin = 8
+    margin = 11 if endpoints is not None else 8
     lo = np.maximum(np.minimum(a, b) - margin, 0)
     hi = np.minimum(np.maximum(a, b) + margin + 1, connected.shape)
     area = tuple(slice(low, high) for low, high in zip(lo, hi))
@@ -59,16 +60,26 @@ def _local_bridge(a, b, voxel_centers, sources, weights, covered, connected):
         unwanted = (ids >= 0) & ~coverage[pixels] & ~src.image.ravel()[pixels]
         cost += np.where(ids < 0, 6, np.where(unwanted, 6 * weight[pixels], 0))
     cost = cost.reshape(tuple(hi - lo))
-    cost[connected[area]] = 0.1
+    local_core = connected[area]
+    if endpoints is not None and radius:
+        cost = maximum_filter(cost, size=2 * radius + 1)
+    cost[local_core] = 0.1
     solver = MCP(cost, fully_connected=False)
     start, end = tuple(a - lo), tuple(b - lo)
+    if endpoints is not None:
+        starts = np.argwhere(local_core & ~binary_erosion(local_core, structure=FACE_NEIGHBORS))
+        local_ends = endpoints[((endpoints >= lo) & (endpoints < hi)).all(axis=1)] - lo
+        ends = [tuple(point) for point in local_ends]
+        distances, _ = solver.find_costs([tuple(point) for point in starts], ends, find_all_ends=False)
+        best = ends[int(np.argmin(distances[tuple(local_ends.T)]))]
+        return np.asarray(solver.traceback(best)) + lo
     solver.find_costs([start], [end])
     return np.asarray(solver.traceback(end)) + lo
 
 
 def connect_all_components_fast(
     hull, min_component_size=1, verbose=False, *, voxel_centers, sources,
-    max_added_shadow_fraction=0.08, bridge_radius=0,
+    max_added_shadow_fraction=0.08, bridge_radius=0, detail_aware=False,
 ):
     hull = hull.copy()
     labels, count = connected_components_3d(hull)
@@ -78,7 +89,8 @@ def connect_all_components_fast(
     connected = labels == main
     main_points = np.argwhere(connected)
     tree = cKDTree(main_points)
-    weights = [silhouette_weights(src.image).ravel() for src in sources]
+    weight_function = shadow_detail_weights if detail_aware else silhouette_weights
+    weights = [weight_function(src.image).ravel() for src in sources]
     covered = [
         projected_mask(pixel_indices(voxel_centers[connected], src), src.image.shape).ravel()
         for src in sources
@@ -102,7 +114,8 @@ def connect_all_components_fast(
         distance, nearest = tree.query(points)
         i = np.argmin(distance)
         path = _local_bridge(main_points[nearest[i]], points[i], voxel_centers,
-                             sources, weights, covered, connected)
+                             sources, weights, covered, connected,
+                             endpoints=points if detail_aware else None, radius=bridge_radius)
         if bridge_radius:
             offsets = np.argwhere(generate_binary_structure(3, 1)) - 1
             expanded = path
@@ -137,7 +150,7 @@ def connect_all_components_fast(
 
 def compute_shadow_hull(
     sources, voxel_centers, enforce_connectivity=True, min_component_size=1,
-    verbose=False, *, original_sources=None, projections=None, bridge_radius=0,
+    verbose=False, *, original_sources=None, projections=None, bridge_radius=0, detail_aware=False,
 ):
     hull = compute_raw_shadow_hull(sources, voxel_centers, projections)
     if not enforce_connectivity:
@@ -145,5 +158,5 @@ def compute_shadow_hull(
     return connect_all_components_fast(
         hull, min_component_size=min_component_size, verbose=verbose, voxel_centers=voxel_centers,
         sources=sources if original_sources is None else original_sources,
-        bridge_radius=bridge_radius,
+        bridge_radius=bridge_radius, detail_aware=detail_aware,
     )

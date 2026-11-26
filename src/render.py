@@ -1,17 +1,28 @@
+from dataclasses import replace
+
 import numpy as np
 from projections import pixel_indices, project_points_orthographic, projected_mask
+
+
+def doubled_shadow_source(source):
+    return replace(source, image=source.image.repeat(2, axis=0).repeat(2, axis=1))
 
 def render_shadow(voxels, voxel_centers, src):
     return projected_mask(pixel_indices(voxel_centers[voxels], src), src.image.shape)
 
 
-def render_mesh_shadow(triangles, source):
+def render_mesh_shadow(triangles, source, *, cell_centers=False):
     """Rasterize projected STL triangles at the target image's pixel centers."""
     height, width = source.image.shape
     x, y, _, _ = project_points_orthographic(
         triangles.reshape(-1, 3), source.direction, source.up,
         source.world_center, source.world_size, source.image.shape,
     )
+    if cell_centers:
+        if width > 1:
+            x = x * (width / (width - 1)) - .5
+        if height > 1:
+            y = y * (height / (height - 1)) - .5
     x, y = x.reshape(-1, 3), y.reshape(-1, 3)
     tolerance = 1e-5
     left = np.maximum(0, np.ceil(x.min(axis=1) - tolerance)).astype(int)

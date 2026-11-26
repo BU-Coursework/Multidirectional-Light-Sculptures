@@ -424,12 +424,14 @@ def show_results(result, optimize_material):
             rows = [{
                 "Candidate": item["name"], "Selected hull": i == selected,
                 "Mean IoU": f"{item['mean_iou']:.1%}", "Worst view": f"{item['worst_iou']:.1%}",
+                "Sampled area IoU": f"{item['mean_area_iou']:.1%}" if "mean_area_iou" in item else "—",
                 "Mesh volume (mm³)": round(item["mesh_volume"], 3),
                 "Connected core width (mm)": round(item["connected_core_width"], 3),
+                "Y-up unsupported voxels": item.get("unsupported_voxels_y_up", "—"),
             } for i, item in enumerate(items)]
             st.table(rows)
             st.caption("Core width is a voxel erosion estimate, capped at seven voxels. "
-                       "The table compares solid hulls before optional hollowing.")
+                       "Unsupported voxels are a Y-up overhang proxy. Confirm supports in your slicer.")
             cleanup = quality.get("print_cleanup", {})
             if cleanup.get("applied"):
                 st.caption(f"Print cleanup removed {cleanup['removed_voxels']:,} voxels and "
@@ -461,6 +463,14 @@ def show_results(result, optimize_material):
                                        file_name=path.name, key=f"candidate_stl_{i}")
 
     st.subheader("4. Output previews")
+
+    area_images = sorted((sim_dir.parent / "sim_area").glob(f"{prefix}_view*_comparison.png"),
+                         key=get_view_number)
+    if area_images:
+        with st.expander("Finer shadow comparison"):
+            st.caption("Each target pixel is sampled at four points. Red marks missing shadow and blue marks extra shadow.")
+            for column, path, summary in zip(st.columns(len(area_images)), area_images, summaries):
+                column.image(str(path), caption=f"View {get_view_number(path)} · {summary['area_iou']:.1%} area IoU")
 
     if sim_dir.exists():
         sim_images = list(sim_dir.glob(f"{prefix}_*.png"))

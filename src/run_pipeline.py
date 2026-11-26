@@ -302,10 +302,10 @@ def run_pipeline(
         log("[PIPELINE] skipping optimization (single view)")
         optimized_sources = sources
 
-    def build(name, edited, targets, passes, bridge_radius=0, bridged=None):
+    def build(name, edited, targets, passes, bridge_radius=0, bridged=None, detail_aware=False):
         if bridged is None:
             bridged = compute_shadow_hull(edited, voxel_centers, original_sources=targets,
-                                          bridge_radius=bridge_radius)
+                                          bridge_radius=bridge_radius, detail_aware=detail_aware)
         voxels, stats = fast_projection_prune(
             bridged, voxel_centers, edited, original_sources=targets, max_passes=passes,
             max_remove_fraction_per_pass=0.15, min_face_neighbors=2,
@@ -327,9 +327,14 @@ def run_pipeline(
                     and any(not np.array_equal(a.image, b.image) for a, b in zip(proposal, original_sources))):
                 candidates.append(build("Alternate edited targets", proposal, original_sources, prune_passes))
                 break
-        if bridge_diameter_voxels > 1 and connected_components_3d(strict)[1] > 1:
-            candidates.append(build("Wider bridges", optimized_sources, original_sources, 0,
-                                    bridge_radius=bridge_diameter_voxels // 2))
+        if connected_components_3d(strict)[1] > 1:
+            candidates.append(build("Detail-aware bridges", optimized_sources, original_sources, prune_passes,
+                                    detail_aware=True))
+            if bridge_diameter_voxels > 1:
+                candidates.append(build("Wider bridges", optimized_sources, original_sources, 0,
+                                        bridge_radius=bridge_diameter_voxels // 2))
+                candidates.append(build("Wider detail-aware bridges", optimized_sources, original_sources, 0,
+                                        bridge_radius=bridge_diameter_voxels // 2, detail_aware=True))
         if searched_sources is not None:
             candidates.append(build("Adjusted light setup", searched_sources, searched_sources, prune_passes))
         if image_size_value > grid:
@@ -344,12 +349,12 @@ def run_pipeline(
         if any(candidate.targets is previous.targets and np.array_equal(candidate.hull, previous.hull)
                for previous in accepted):
             continue
-        metrics, mesh = measure_candidate(candidate, world_size, pitch)
+        metrics, mesh = measure_candidate(candidate, world_size, pitch, fine_sampling=rank_stl)
         measured.append(metrics)
         meshes.append(mesh)
         accepted.append(candidate)
         log(f"[STL] {candidate.name}: {metrics['mean_iou']:.1%} mean IoU, "
-            f"{metrics['worst_iou']:.1%} worst view")
+            f"{metrics['mean_area_iou']:.1%} sampled area IoU")
     if not accepted:
         (output_dir / "fit_diagnostics.json").write_text(json.dumps(fit, indent=2), encoding="utf-8")
         raise ValueError("The silhouettes leave no shared sculpture volume within the allowed edits. "
@@ -366,6 +371,8 @@ def run_pipeline(
                                           base.edited, base.pruning, base.adjusted_setup)
             metrics, mesh = measure_candidate(cleaned, world_size, pitch, mesh=mesh)
             if (metrics["connected_core_width"] >= measured[chosen]["connected_core_width"]
+                    and metrics["mean_area_iou"] >= measured[chosen]["mean_area_iou"] - .001
+                    and metrics["worst_area_iou"] >= measured[chosen]["worst_area_iou"] - .001
                     and metrics["mesh_volume"] < measured[chosen]["mesh_volume"]):
                 untrimmed = chosen
                 chosen = len(accepted)
@@ -422,6 +429,7 @@ def run_pipeline(
     hull_summaries = simulate_and_save(
         hull, voxel_centers, target_sources, out_dir=str(sim_dir), prefix="hull",
         triangles=mesh_triangles_in_world(mesh, world_size, pitch), edited_sources=edited_comparison,
+        area_dir=str(output_dir / "sim_area") if rank_stl else None,
     )
 
     carved_stl_path = None
@@ -450,9 +458,10 @@ def run_pipeline(
         elif carved_count < hull.sum():
             hollow = SculptureCandidate("Hollow hull", carved, connected_hull, target_sources,
                                         optimized_sources, selected.pruning, selected.adjusted_setup)
-            hollow_metrics, hollow_mesh = measure_candidate(hollow, world_size, pitch)
+            hollow_metrics, hollow_mesh = measure_candidate(hollow, world_size, pitch, fine_sampling=rank_stl)
             solid_metrics = measured[chosen]
             keep_hollow = (hollow_metrics["mean_iou"] >= solid_metrics["mean_iou"] - .005
+                           and hollow_metrics["mean_area_iou"] >= solid_metrics["mean_area_iou"] - .005
                            and hollow_metrics["score"] >= solid_metrics["score"] - .005)
             if keep_hollow and cleanup["applied"]:
                 before = mesh_shadows(mesh, target_sources, world_size, pitch)
@@ -479,6 +488,7 @@ def run_pipeline(
         carved_summaries = simulate_and_save(
             carved, voxel_centers, target_sources, out_dir=str(sim_dir), prefix="carved",
             triangles=mesh_triangles_in_world(carved_mesh, world_size, pitch), edited_sources=edited_comparison,
+            area_dir=str(output_dir / "sim_area") if rank_stl else None,
         )
         log(f"[PIPELINE] saved carved mesh: {carved_stl_path}")
 

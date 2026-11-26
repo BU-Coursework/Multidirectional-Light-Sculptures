@@ -1,7 +1,7 @@
 import os
 import numpy as np
 from PIL import Image
-from render import render_mesh_shadow, render_shadow
+from render import doubled_shadow_source, render_mesh_shadow, render_shadow
 
 def save_grayscale(arr_uint8, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -49,7 +49,7 @@ def evaluate_view(target, actual):
     }
 
 def simulate_and_save(voxels, voxel_centers, sources, out_dir, prefix, *,
-                      triangles=None, edited_sources=None):
+                      triangles=None, edited_sources=None, area_dir=None):
     """
     Render all views and save:
     - target
@@ -74,6 +74,12 @@ def simulate_and_save(voxels, voxel_centers, sources, out_dir, prefix, *,
             edited = edited_sources[i].image
             metrics["edited_target_iou"] = evaluate_view(edited, actual)["iou"]
             metrics["optimizer_added_pixels"] = int((edited & ~target).sum())
+        if triangles is not None and area_dir is not None:
+            fine = doubled_shadow_source(src)
+            fine_actual = render_mesh_shadow(triangles, fine, cell_centers=True)
+            metrics["area_iou"] = evaluate_view(fine.image, fine_actual)["iou"]
+            save_grayscale(make_comparison_image(fine.image, fine_actual),
+                           os.path.join(area_dir, f"{prefix}_view{i}_comparison.png"))
 
         save_bool_mask(target, os.path.join(out_dir, f"{prefix}_view{i}_target.png"))
         save_bool_mask(actual, os.path.join(out_dir, f"{prefix}_view{i}_actual.png"))
