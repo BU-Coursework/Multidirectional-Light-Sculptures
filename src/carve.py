@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.ndimage import distance_transform_edt, label
-from projections import project_points_orthographic
+from projections import project_pixels
 
 
 def precompute_voxel_projections(voxels, voxel_centers, sources):
@@ -9,17 +9,7 @@ def precompute_voxel_projections(voxels, voxel_centers, sources):
 
     projections = []
     for src in sources:
-        px, py, valid, _ = project_points_orthographic(
-            pts,
-            src.direction,
-            src.up,
-            src.world_center,
-            src.world_size,
-            src.image.shape
-        )
-
-        pxi = np.clip(np.round(px).astype(int), 0, src.image.shape[1] - 1)
-        pyi = np.clip(np.round(py).astype(int), 0, src.image.shape[0] - 1)
+        pyi, pxi, valid, _ = project_pixels(pts, src)
 
         projections.append({
             "valid": valid.copy(),

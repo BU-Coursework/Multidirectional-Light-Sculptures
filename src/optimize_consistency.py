@@ -1,11 +1,11 @@
 import numpy as np
-from scipy.ndimage import binary_erosion, binary_dilation, binary_closing
+from scipy.ndimage import binary_erosion, binary_dilation, binary_closing, binary_fill_holes
 
-from shadow_hull import compute_shadow_hull
+from shadow_hull import compute_shadow_hull, connected_components_3d, preferred_component
 from render import render_shadow
-from projections import project_points_orthographic
+from projections import project_pixels
 from warp import smooth_displacement, warp_mask
-from distances import outside_distance
+from distances import outside_distance, silhouette_weights
 
 
 def inconsistent_pixels(desired: np.ndarray, actual: np.ndarray) -> np.ndarray:
@@ -32,31 +32,16 @@ def precompute_source_projection_data(sources, voxel_centers):
     proj_data = []
 
     for src in sources:
-        px, py, valid, depth = project_points_orthographic(
-            pts,
-            src.direction,
-            src.up,
-            src.world_center,
-            src.world_size,
-            src.image.shape
-        )
-
-        pxi = np.round(px).astype(int)
-        pyi = np.round(py).astype(int)
-
-        ray_lookup = {}
-        valid_idxs = np.where(valid)[0]
-
-        for idx in valid_idxs:
-            key = (pxi[idx], pyi[idx])
-            if key not in ray_lookup:
-                ray_lookup[key] = []
-            ray_lookup[key].append(idx)
-
-        for key in ray_lookup:
-            arr = np.array(ray_lookup[key], dtype=int)
-            arr = arr[np.argsort(depth[arr])]
-            ray_lookup[key] = arr
+        pyi, pxi, valid, depth = project_pixels(pts, src)
+        width = src.image.shape[1]
+        indices = np.flatnonzero(valid)
+        pixels = pyi[indices] * width + pxi[indices]
+        order = np.lexsort((depth[indices], pixels))
+        indices, pixels = indices[order], pixels[order]
+        keys, starts = np.unique(pixels, return_index=True)
+        ends = np.r_[starts[1:], len(indices)]
+        ray_lookup = {(int(key % width), int(key // width)): indices[start:end]
+                      for key, start, end in zip(keys, starts, ends)}
 
         proj_data.append({
             "px": pxi,
@@ -142,10 +127,16 @@ def build_displacement_constraints(
     voxel_centers,
     sample_per_view=300,
     max_ray_samples=24,
+    *,
+    actuals=None,
+    proj_data=None,
+    required_sources=None,
 ):
-    hull = compute_shadow_hull(sources, voxel_centers)
-    actuals = [render_shadow(hull, voxel_centers, s) for s in sources]
-    inconsistencies = [inconsistent_pixels(s.image, a) for s, a in zip(sources, actuals)]
+    if actuals is None:
+        hull = compute_shadow_hull(sources, voxel_centers)
+        actuals = [render_shadow(hull, voxel_centers, s) for s in sources]
+    targets = sources if required_sources is None else required_sources
+    inconsistencies = [inconsistent_pixels(s.image, a) for s, a in zip(targets, actuals)]
     outside_cost_maps = [outside_distance(s.image) for s in sources]
     boundary_pts_list = [boundary_pixels(s.image) for s in sources]
 
@@ -153,7 +144,8 @@ def build_displacement_constraints(
     dy_list = [np.zeros_like(s.image, dtype=float) for s in sources]
     add_maps = [np.zeros_like(s.image, dtype=bool) for s in sources]
 
-    _, proj_data = precompute_source_projection_data(sources, voxel_centers)
+    if proj_data is None:
+        _, proj_data = precompute_source_projection_data(sources, voxel_centers)
 
     total_missing = 0
 
@@ -232,105 +224,83 @@ def optimize_silhouettes(
     plateau_patience=2,
     fallback_growth_threshold=5,
     fallback_global_dilation=True,
-    verbose=True
+    verbose=True,
+    on_candidate=None,
 ):
-    """
-    Iteratively deform silhouettes to reduce inconsistency:
-    - build hull from current silhouettes
-    - detect missing pixels
-    - infer target growth locations in the other silhouettes
-    - combine:
-        - smooth warp from sparse displacement field
-        - discrete growth from add_maps
-        - fallback dilation when progress stalls or growth is too weak
-    - keep best result
-    """
+    """Propose limited mask growth and keep the best connected original shadow."""
     current_sources = list(sources)
     best_sources = list(sources)
-    best_missing = float("inf")
+    best_score = -1.0
     stall_count = 0
-
-    growth_structure = np.ones((2 * growth_radius + 1, 2 * growth_radius + 1), dtype=bool)
+    proj_data = None
+    weights = [silhouette_weights(src.image) for src in sources]
     cleanup_structure = np.ones((3, 3), dtype=bool)
-    fallback_structure = np.ones((3, 3), dtype=bool)
+    growth_structure = np.ones((2 * growth_radius + 1, 2 * growth_radius + 1), dtype=bool)
+    holes = [binary_fill_holes(src.image, structure=cleanup_structure) & ~src.image
+             for src in sources]
+    distances = [outside_distance(src.image) for src in sources]
+    budgets = [max(2, int(src.image.sum() * .06)) if src.image.any() else 0 for src in sources]
 
-    for it in range(iterations):
-        if verbose:
-            print(f"\n[OPTIMIZER] iteration {it+1}/{iterations}")
-
-        dx_list, dy_list, add_maps, actuals, inconsistencies, stats = build_displacement_constraints(
-            current_sources,
-            voxel_centers,
-            sample_per_view=sample_per_view,
-            max_ray_samples=max_ray_samples,
-        )
-
-        total_missing = stats["total_missing"]
-        missing_per_view = stats["missing_per_view"]
-        growth_pixels_per_view = stats["growth_pixels_per_view"]
-        worst_view = int(np.argmax(missing_per_view)) if len(missing_per_view) > 0 else 0
-
-        if verbose:
-            print(f"[OPTIMIZER] growth pixels per view: {growth_pixels_per_view}")
-            print(f"[OPTIMIZER] iter {it+1}: missing={total_missing}, per_view={missing_per_view}")
-
-        if total_missing < best_missing:
-            best_missing = total_missing
+    for it in range(iterations + 1):
+        hull = compute_shadow_hull(current_sources, voxel_centers, original_sources=sources)
+        labels, count = connected_components_3d(hull)
+        if count > 1:
+            hull = labels == preferred_component(labels, count, voxel_centers, sources)
+        actuals = [render_shadow(hull, voxel_centers, src) for src in sources]
+        scores = [
+            weight[src.image & actual].sum() / max(weight[src.image | actual].sum(), 1)
+            for src, actual, weight in zip(sources, actuals, weights)
+        ]
+        score = .75 * float(np.mean(scores)) + .25 * min(scores)
+        if on_candidate is not None and it > 0 and hull.any():
+            on_candidate(score, current_sources)
+        if score > best_score:
+            best_score = score
             best_sources = list(current_sources)
             stall_count = 0
         else:
             stall_count += 1
+        if verbose:
+            print(f"[OPTIMIZER] candidate {it}/{iterations}: original weighted overlap={score:.4f}")
 
-        if total_missing == 0:
-            if verbose:
-                print("[OPTIMIZER] perfect consistency reached")
+        if score == 1 or stall_count >= plateau_patience or it == iterations:
             break
+        if proj_data is None:
+            _, proj_data = precompute_source_projection_data(sources, voxel_centers)
 
+        dx_list, dy_list, add_maps, _, _, stats = build_displacement_constraints(
+            current_sources, voxel_centers, sample_per_view=sample_per_view,
+            max_ray_samples=max_ray_samples, actuals=actuals, proj_data=proj_data,
+            required_sources=sources,
+        )
+        if not stats["total_missing"]:
+            break
+        worst_view = int(np.argmax(stats["missing_per_view"]))
         updated_sources = []
-
         for idx, (src, dx, dy, add_map) in enumerate(zip(current_sources, dx_list, dy_list, add_maps)):
-            # smooth sparse displacement field
             dx_s, dy_s = smooth_displacement(dx, dy, sigma=sigma)
-
-            # continuous warp
-            warped = warp_mask(
-                src.image,
-                dx=alpha * dx_s,
-                dy=alpha * dy_s
-            )
-
-            # discrete growth proposed by least-cost-voxel constraints
+            warped = warp_mask(src.image, dx=alpha * dx_s, dy=alpha * dy_s)
             grown = binary_dilation(add_map, structure=growth_structure)
-
-            # combine deformations
-            new_img = src.image | warped | grown
-
-            # fallback: if growth suggestions are too weak, help the worst-view silhouette expand a bit
-            if idx == worst_view and growth_pixels_per_view[idx] < fallback_growth_threshold:
-                new_img = binary_dilation(new_img, structure=fallback_structure)
-
-            # fallback on plateau: if stalled, allow a tiny additional dilation on the worst view
-            if fallback_global_dilation and stall_count >= 1 and idx == worst_view:
-                new_img = binary_dilation(new_img, structure=fallback_structure)
-
-            new_img = binary_closing(new_img, structure=cleanup_structure)
-
+            proposal = src.image | warped | grown
+            if idx == worst_view and (stats["growth_pixels_per_view"][idx] < fallback_growth_threshold
+                                      or (fallback_global_dilation and stall_count)):
+                proposal = binary_dilation(proposal, structure=cleanup_structure)
+            proposal |= binary_closing(proposal, structure=cleanup_structure)
+            allowed = proposal & ~src.image & ~holes[idx]
+            remaining = max(0, budgets[idx] - int((src.image & ~sources[idx].image).sum()))
+            candidates = np.flatnonzero(allowed)
+            # Prioritize actual missing-ray proposals over neighboring pixels.
+            priority = np.lexsort((distances[idx].ravel()[candidates], ~add_map.ravel()[candidates]))
+            new_img = src.image.copy()
+            new_img.flat[candidates[priority[:remaining]]] = True
             updated_sources.append(type(src)(
-                image=new_img,
-                direction=src.direction,
-                up=src.up,
-                world_center=src.world_center,
-                world_size=src.world_size
+                image=new_img, direction=src.direction, up=src.up,
+                world_center=src.world_center, world_size=src.world_size,
             ))
-
+        if all(np.array_equal(old.image, new.image) for old, new in zip(current_sources, updated_sources)):
+            break
         current_sources = updated_sources
 
-        if stall_count >= plateau_patience:
-            if verbose:
-                print("[OPTIMIZER] early stop: no improvement")
-            break
-
     if verbose:
-        print(f"[OPTIMIZER] best total missing: {best_missing}")
-
+        print(f"[OPTIMIZER] best original weighted overlap: {best_score:.4f}")
     return best_sources

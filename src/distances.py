@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import binary_dilation, binary_fill_holes, distance_transform_edt
 
 # Distance fields for binary silhouettes.
 def silhouette_distance_fields(mask: np.ndarray):
@@ -18,3 +18,17 @@ def outside_distance(mask: np.ndarray) -> np.ndarray:
 def inside_distance(mask: np.ndarray) -> np.ndarray:
     # Positive distance inside mask.
     return distance_transform_edt(mask) * mask
+
+
+def silhouette_weights(mask):
+    holes = binary_fill_holes(mask, structure=np.ones((3, 3), dtype=bool)) & ~mask
+    thin = mask & (distance_transform_edt(mask) <= 1.5)
+    return 1.0 + thin + 2.0 * holes
+
+
+def shadow_detail_weights(mask):
+    """Penalize filling enclosed openings and crossing fine silhouette detail."""
+    holes = binary_fill_holes(mask, structure=np.ones((3, 3), dtype=bool)) & ~mask
+    thin = mask & (distance_transform_edt(mask) <= 1.5)
+    near_detail = binary_dilation(thin, iterations=2) & ~mask
+    return 1.0 + 3.0 * holes + 2.0 * near_detail

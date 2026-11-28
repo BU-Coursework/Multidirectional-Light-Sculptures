@@ -33,3 +33,23 @@ def project_points_orthographic(points, direction, up, world_center, world_size,
     valid = (px >= 0) & (px <= W - 1) & (py >= 0) & (py <= H - 1)
 
     return px, py, valid, z
+
+
+def project_pixels(points, source):
+    x, y, valid, depth = project_points_orthographic(
+        points, source.direction, source.up, source.world_center,
+        source.world_size, source.image.shape,
+    )
+    return np.rint(y).astype(np.int32), np.rint(x).astype(np.int32), valid, depth
+
+
+def pixel_indices(points, source):
+    """Flatten pixel coordinates, using -1 for points outside the frame."""
+    rows, cols, valid, _ = project_pixels(points, source)
+    return np.where(valid, rows * source.image.shape[1] + cols, -1)
+
+
+def projected_mask(indices, shape):
+    mask = np.zeros(np.prod(shape), dtype=bool)
+    mask[indices[indices >= 0]] = True
+    return mask.reshape(shape)

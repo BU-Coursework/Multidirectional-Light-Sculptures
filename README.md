@@ -15,6 +15,7 @@ The multidirectional light sculpture generation pipeline takes as input one to t
 - [Pipeline Stages](#pipeline-stages)
 - [Important Parameters](#important-parameters)
 - [Output Files](#output-files)
+- [Candidate selection and physical checks](#candidate-selection-and-physical-checks)
 - [Known Limitations](#known-limitations)
 - [Future Improvements](#future-improvements)
 
@@ -106,8 +107,8 @@ pip install -r requirements.txt
 
 Input silhouettes are be binary images where:
 
-- White pixels represent required shadow coverage
-- Black pixels represent empty shadow
+- Dark pixels represent required shadow coverage
+- Light pixels represent empty shadow
 
 You may attempt to use with non binary images; however, the conversion from non binary images to binary images may lose a lot of the detail in the image. For best results, choose input images with clear dark and light regions. For best consistency, choose input images that are similar sizes/shapes.
 
@@ -128,7 +129,7 @@ python src/run_pipeline.py inputs/view4.png inputs/view6.png --grid 96 --image-s
 ```
 
 The --grid, --image-size, --optimize-material, and --directions flags are optional.
-You must provide at least 2 silhouette images.
+Provide one to three silhouette images. By default, the CLI matches the mask resolution to the voxel grid.
 Custom directions should be given as semicolon-separated 3D vectors, one per input image.
 
 ## Running the Web UI (Streamlit App)
@@ -151,13 +152,12 @@ Alternatively, we have hosted the streamlit app. To access, click on this link:
 
 1. Load binary silhouette images as binary matrices
 2. Configure shadow sources and light directions
-3. Optimize silhouettes to reduce inconsistent shadow pixels between silhouettes
-4. Compute conservative shadow hull
-5. Prune redundant voxels and ensure single component constraint on structure
-6. Hollow out the sculpture
-7. Simulate hull shadows
-8. Export carved mesh as STL
-9. Save simulated shadow renders and debug slices to output run directory
+3. Check which original target pixels have a voxel-center ray and which rays the other silhouettes rule out
+4. Evaluate the strict hull and limited silhouette edits against the original masks, including thin features and holes
+5. Route needed connections and prune redundant voxels while preserving original shadow coverage and face connectivity
+6. Optionally hollow out the sculpture
+7. Export the STL and rasterize its projected triangles against the original masks
+8. Save shadow comparisons, fit diagnostics, and debug artifacts to the output run directory
 
 ## Important Parameters
 
@@ -181,10 +181,35 @@ Higher voxel resolution improves shadow accuracy but increases runtime and memor
 The pipeline generates:
 
 - `outputs/meshes/shadow_hull.stl`
-- Shadow simulation images per view
-- Debug silhouette masks
-- Debug voxel slice images
+- STL shadow simulation images per view, with missing and extra pixels compared to the original masks
+- `fit_diagnostics.json` with per-view counts for sampling, silhouette conflicts, and connectivity losses
+- `candidate_quality.json` with the selected light setup, per-view IoU, thin-feature recall, hole preservation, STL volume, and connected core width. Non-dominated alternatives can be downloaded in the app.
+- Debug silhouette masks and voxel slices
 - Metrics printed to the terminal
+
+## Candidate selection and physical checks
+
+By default, the pipeline projects several STL candidates using the original masks. It weights mean overlap, the weakest view, and preservation of thin features and holes. Candidate geometry can vary by mask edit, pruning level, bridge width, or area sampling when the mask resolution exceeds the voxel grid. The reported connected core width is an erosion-based estimate capped at seven voxels. Printer tolerances and the actual minimum wall or bridge thickness need separate verification.
+
+Candidate ranking also samples four points per target pixel. Background shadows near fine features and inside enclosed openings carry extra cost. The app and `sim_area/` show finer error maps while the original-resolution previews remain comparable across runs. For fragmented hulls the solver tries bridges with alternate endpoints, then tries wider routes that consider the full connector footprint. The candidate table shows connected core width and a Y-up unsupported-voxel estimate for comparing layouts before slicing.
+
+Add `--search-alignment` to try small frame offsets and scale changes. Add `--search-light-angles` when the lights can move. Both keep view 1 fixed and leave the input pixels unchanged. The reported direction, up vector, frame center, and frame size describe the setup for each selected shadow. The CLI flag `--bridge-diameter-voxels 5` tries a wider bridge alternative, and `--center-ranking` reproduces the prior voxel-ranked selection.
+
+Print cleanup runs by default after STL candidate selection. It trims thin features and restores connections or shadow coverage as needed. It keeps a trim only when the resulting STL stays connected and watertight, preserves every previously correct target pixel, adds no new off-target shadow, and preserves the core-width estimate. The untrimmed candidate remains available for comparison. Use `--no-print-cleanup` or clear **Trim thin features for printing** to bypass it. Check the selected STL in your slicer at the intended physical scale to evaluate overhangs and supports.
+
+Run the generated holdouts from the repository root.
+
+```bash
+python scripts/benchmark_shadow_quality.py --output outputs/holdout
+```
+
+For a physical check, start with the three-view holdout and export the selected STL. Use the selected setup in `candidate_quality.json` to orient the object and lights. Mark the four corners of each predicted frame on a flat, light screen. Lock the camera exposure and position, then photograph each view with only its corresponding light on and the four marks visible. The marks should sit just outside the shadow area. Compare the dark photographed shadow to the pipeline’s white-on-black `*_actual.png`.
+
+```bash
+python scripts/compare_physical_shadow.py path/to/hull_view0_actual.png path/to/view0.jpg --corner 110,80 --corner 760,93 --corner 735,710 --corner 98,690 --threshold 128 --output outputs/physical-view0
+```
+
+Use your photo’s corner coordinates in clockwise order from the top left. The tool writes a registered photo, binary observed shadow, error overlay, and JSON metrics. Supply `--target path/to/hull_view0_target.png` to also score the photographed shadow against the intended silhouette.
 
 ## Known Limitations
 

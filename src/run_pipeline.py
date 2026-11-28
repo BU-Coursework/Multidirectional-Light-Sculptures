@@ -1,20 +1,29 @@
 import argparse
+from dataclasses import asdict
+from itertools import combinations
 import numpy as np
 import time
 
 from image_io import load_binary_image, save_mask
 from voxel_ops import make_voxel_centers, voxel_pitch
-from shadow_hull import compute_shadow_hull
+from shadow_hull import compute_raw_shadow_hull, compute_shadow_hull, connected_components_3d
 from shadow_source import build_sources
-from export_mesh import export_voxels_to_stl
+from export_mesh import mesh_triangles_in_world
 from carve import carve_hollow_shell_strict
 from simulate import simulate_and_save
+from projections import pixel_indices, projected_mask
+from render import render_shadow
 from debug_slices import save_voxel_slices
 from optimize_consistency import optimize_silhouettes
 from postprocess_prune import fast_projection_prune
+from print_cleanup import mesh_shadows, shadow_regressions, trim_for_print
+from light_setup import search_light_setup
+from quality_candidates import (
+    SculptureCandidate, footprint_sampled_masks, measure_candidate, select_candidate, tradeoff_options,
+)
 from pathlib import Path
 from datetime import datetime
-import time
+import json
 import warnings
 warnings.filterwarnings("ignore", module="paramiko")
 
@@ -58,13 +67,13 @@ def make_run_output_dir(base_dir="outputs"):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Build a multi-view shadow sculpture from 2 or more silhouette images."
+        description="Build a shadow sculpture from one to three silhouette images."
     )
 
     parser.add_argument(
         "views",
         nargs="+",
-        help="2 or more silhouette image paths"
+        help="One to three silhouette image paths"
     )
 
     parser.add_argument(
@@ -84,8 +93,8 @@ def parse_args():
     parser.add_argument(
         "--image-size",
         type=int,
-        default=256,
-        help="Square size used to resize input silhouettes"
+        default=None,
+        help="Square size used to resize silhouette images (defaults to --grid)"
     )
 
     parser.add_argument(
@@ -132,27 +141,91 @@ def parse_args():
     parser.add_argument(
         "--opt-iters",
         type=int,
-        default=4,
+        default=6,
         help="Silhouette optimization iterations"
     )
+    parser.add_argument("--center-ranking", action="store_true",
+                        help="Use the voxel-center optimizer choice without comparing STL candidates")
+    parser.add_argument("--search-alignment", action="store_true",
+                        help="Try bounded offsets and scale changes for views after the first")
+    parser.add_argument("--search-light-angles", action="store_true",
+                        help="Try bounded light angle changes for views after the first")
+    parser.add_argument("--bridge-diameter-voxels", type=int, choices=(1, 3, 5), default=3,
+                        help="Diameter of the optional thicker-bridge candidate")
+    parser.add_argument("--no-print-cleanup", action="store_true",
+                        help="Keep the selected hull without trimming thin geometry")
 
     args = parser.parse_args()
 
-    if len(args.views) < 2:
-        parser.error("Please provide at least 2 silhouette images.")
+    if len(args.views) > 3:
+        parser.error("Please provide one to three silhouette images.")
+    if args.center_ranking and (args.search_alignment or args.search_light_angles):
+        parser.error("Setup search requires STL candidate ranking.")
 
     return args
+
+
+def assess_strict_hull(sources, voxel_centers):
+    points = voxel_centers.reshape(-1, 3)
+    projections = [pixel_indices(points, src) for src in sources]
+    raw = compute_raw_shadow_hull(sources, voxel_centers, projections)
+    views = []
+    for src, ids in zip(sources, projections):
+        reachable = projected_mask(ids, src.image.shape)
+        strict = projected_mask(ids[raw.ravel()], src.image.shape)
+        views.append({
+            "target_pixels": int(src.image.sum()),
+            "no_center_ray": int((src.image & ~reachable).sum()),
+            "blocked_by_other_views": int((src.image & reachable & ~strict).sum()),
+            "strict_coverage": int((src.image & strict).sum()),
+        })
+    disjoint_view_pairs = []
+    if len(sources) > 1 and not raw.any():
+        valid_masks = [
+            (ids >= 0) & src.image.ravel()[np.maximum(ids, 0)]
+            for src, ids in zip(sources, projections)
+        ]
+        disjoint_view_pairs = [
+            [i + 1, j + 1] for i, j in combinations(range(len(sources)), 2)
+            if not (valid_masks[i] & valid_masks[j]).any()
+        ]
+    return raw, {
+        "strict_voxels": int(raw.sum()), "disjoint_view_pairs": disjoint_view_pairs, "views": views,
+    }
+
+
+def _setup_description(sources, adjustments=None):
+    views = [
+        {"direction": src.direction.tolist(), "up": src.up.tolist(),
+         "world_center": src.world_center.tolist(), "frame_size": src.world_size}
+        for src in sources
+    ]
+    if adjustments is not None:
+        for view, adjustment in zip(views, adjustments):
+            view.update(asdict(adjustment))
+    return views
 
 
 def run_pipeline(
     view_paths,
     world_size=1.0,
     grid=120,
-    image_size_value=160,
+    image_size_value=None,
     optimize_material=False,
     output_dir=None,
     prune_passes=6,
     log=print,
+    directions=None,
+    opt_iters=6,
+    threshold=128,
+    close_iters=0,
+    open_iters=0,
+    dilate_iters=0,
+    rank_stl=True,
+    search_alignment=False,
+    search_light_angles=False,
+    bridge_diameter_voxels=3,
+    print_cleanup=True,
 ):
     t0 = time.time()
 
@@ -175,95 +248,199 @@ def run_pipeline(
     log(f"[PIPELINE] output directory: {output_dir}")
 
     nx = ny = nz = grid
+    image_size_value = grid if image_size_value is None else image_size_value
     image_size = (image_size_value, image_size_value)
 
     images = []
     for i, path in enumerate(view_paths):
-        img = load_binary_image(path, size=image_size)
+        img = load_binary_image(path, size=image_size, threshold=threshold,
+                                close_iters=close_iters, open_iters=open_iters, dilate_iters=dilate_iters)
         images.append(img)
 
     for i, img in enumerate(images):
         save_mask(img, str(debug_dir / "masks" / "base" / f"view{i}_mask.png"))
 
-    sources = build_sources(images, world_size)
+    sources = build_sources(images, world_size, directions=directions)
     original_sources = sources
     voxel_centers = make_voxel_centers(nx, ny, nz, world_size)
+    pitch = voxel_pitch(world_size, nx, ny, nz)
+    strict, fit = assess_strict_hull(original_sources, voxel_centers)
+    for i, view in enumerate(fit["views"]):
+        log(f"[FIT] view {i + 1}: {view['no_center_ray']} pixels without a voxel-center ray, "
+            f"{view['blocked_by_other_views']} ruled out by other silhouettes")
+    for first, second in fit["disjoint_view_pairs"]:
+        log(f"[FIT] views {first} and {second} share no strict voxel volume. "
+            "Check mask placement and light directions if the edited result loses detail.")
 
-    # optimize the input silhouettes if more than one inputted
+    searched_sources = None
+    setup_search = None
+    if rank_stl and len(sources) > 1 and (search_alignment or search_light_angles):
+        adjusted, adjustments, baseline, best = search_light_setup(
+            original_sources, grid, alignment=search_alignment, angles=search_light_angles)
+        setup_search = {"coarse_before": baseline, "coarse_after": best,
+                        "views": _setup_description(adjusted, adjustments)}
+        if best > baseline:
+            searched_sources = adjusted
+        log(f"[FIT] coarse setup search: {baseline:.1%} to {best:.1%}")
+
+    history = []
     if len(sources) > 1:
         log("[PIPELINE] optimizing silhouettes...")
 
         optimized_sources = optimize_silhouettes(
             sources,
             voxel_centers,
-            iterations=6,
+            iterations=opt_iters,
             alpha=0.15,
             sigma=4.0,
             sample_per_view=300,
             growth_radius=2,
             verbose=True,
+            on_candidate=(lambda score, views: history.append((score, views))) if rank_stl else None,
         )
-
-        for i, src in enumerate(optimized_sources):
-            save_mask(
-                src.image,
-                str(debug_dir / "masks" / "opt" / f"view{i}_optimized_mask.png")
-            )
-
-        sources = optimized_sources
     else:
         log("[PIPELINE] skipping optimization (single view)")
         optimized_sources = sources
 
-    log("[PIPELINE] computing shadow hull...")
-    hull = compute_shadow_hull(sources, voxel_centers)
+    def build(name, edited, targets, passes, bridge_radius=0, bridged=None, detail_aware=False):
+        if bridged is None:
+            bridged = compute_shadow_hull(edited, voxel_centers, original_sources=targets,
+                                          bridge_radius=bridge_radius, detail_aware=detail_aware)
+        voxels, stats = fast_projection_prune(
+            bridged, voxel_centers, edited, original_sources=targets, max_passes=passes,
+            max_remove_fraction_per_pass=0.15, min_face_neighbors=2,
+            redundancy_threshold=2.0, verbose=False,
+        )
+        return SculptureCandidate(name, voxels, bridged, targets, edited, stats, targets is searched_sources)
 
-    log(f"[PIPELINE] initial hull voxel count: {int(hull.sum())}")
-    log(f"[PIPELINE] initial hull occupancy ratio: {float(hull.mean())}")
+    log("[PIPELINE] building sculpture candidates...")
+    incumbent = build("Voxel-ranked hull", optimized_sources, original_sources, prune_passes)
+    candidates = [incumbent]
+    if rank_stl:
+        if prune_passes:
+            candidates.append(build("Unpruned hull", optimized_sources, original_sources, 0,
+                                    bridged=incumbent.bridged))
+        if any(not np.array_equal(a.image, b.image) for a, b in zip(original_sources, optimized_sources)):
+            candidates.append(build("Unedited targets", original_sources, original_sources, prune_passes))
+        for _, proposal in sorted(history, key=lambda entry: entry[0], reverse=True):
+            if (any(not np.array_equal(a.image, b.image) for a, b in zip(proposal, optimized_sources))
+                    and any(not np.array_equal(a.image, b.image) for a, b in zip(proposal, original_sources))):
+                candidates.append(build("Alternate edited targets", proposal, original_sources, prune_passes))
+                break
+        if connected_components_3d(strict)[1] > 1:
+            candidates.append(build("Detail-aware bridges", optimized_sources, original_sources, prune_passes,
+                                    detail_aware=True))
+            if bridge_diameter_voxels > 1:
+                candidates.append(build("Wider bridges", optimized_sources, original_sources, 0,
+                                        bridge_radius=bridge_diameter_voxels // 2))
+                candidates.append(build("Wider detail-aware bridges", optimized_sources, original_sources, 0,
+                                        bridge_radius=bridge_diameter_voxels // 2, detail_aware=True))
+        if searched_sources is not None:
+            candidates.append(build("Adjusted light setup", searched_sources, searched_sources, prune_passes))
+        if image_size_value > grid:
+            for name, coverage in (("Area-sampled masks", .50), ("Detail-preserving area masks", .25)):
+                sampled = footprint_sampled_masks(original_sources, grid, coverage)
+                candidates.append(build(name, sampled, original_sources, prune_passes))
 
-    log("[PIPELINE] pruning hull...")
-    hull, post_stats = fast_projection_prune(
-        hull,
-        voxel_centers,
-        optimized_sources=optimized_sources,
-        original_sources=original_sources,
-        max_passes=prune_passes,
-        max_remove_fraction_per_pass=0.15,
-        min_face_neighbors=2,
-        redundancy_threshold=2.0,
-        cleanup_each_pass=True,
-        verbose=True,
-    )
+    measured, meshes, accepted = [], [], []
+    for candidate in candidates:
+        if not candidate.hull.any():
+            continue
+        if any(candidate.targets is previous.targets and np.array_equal(candidate.hull, previous.hull)
+               for previous in accepted):
+            continue
+        metrics, mesh = measure_candidate(candidate, world_size, pitch, fine_sampling=rank_stl)
+        measured.append(metrics)
+        meshes.append(mesh)
+        accepted.append(candidate)
+        log(f"[STL] {candidate.name}: {metrics['mean_iou']:.1%} mean IoU, "
+            f"{metrics['mean_area_iou']:.1%} sampled area IoU")
+    if not accepted:
+        (output_dir / "fit_diagnostics.json").write_text(json.dumps(fit, indent=2), encoding="utf-8")
+        raise ValueError("The silhouettes leave no shared sculpture volume within the allowed edits. "
+                         "Check their alignment and light directions.")
+    chosen = select_candidate(measured)
+    cleanup = {"enabled": rank_stl and print_cleanup, "applied": False}
+    untrimmed = None
+    if cleanup["enabled"]:
+        base = accepted[chosen]
+        trimmed = trim_for_print(base.hull, voxel_centers, base.targets, meshes[chosen], world_size, pitch)
+        if trimmed is not None:
+            voxels, mesh, stats = trimmed
+            cleaned = SculptureCandidate("Print cleanup", voxels, base.bridged, base.targets,
+                                          base.edited, base.pruning, base.adjusted_setup)
+            metrics, mesh = measure_candidate(cleaned, world_size, pitch, mesh=mesh)
+            if (metrics["connected_core_width"] >= measured[chosen]["connected_core_width"]
+                    and metrics["mean_area_iou"] >= measured[chosen]["mean_area_iou"] - .001
+                    and metrics["worst_area_iou"] >= measured[chosen]["worst_area_iou"] - .001
+                    and metrics["mesh_volume"] < measured[chosen]["mesh_volume"]):
+                untrimmed = chosen
+                chosen = len(accepted)
+                accepted.append(cleaned)
+                measured.append(metrics)
+                meshes.append(mesh)
+                cleanup.update(stats, applied=True, original_candidate=untrimmed)
+                log(f"[PRINT] removed {stats['removed_voxels']:,} voxels with STL shadow protection")
+        if not cleanup["applied"]:
+            log("[PRINT] kept the selected geometry after cleanup checks")
+    selected = accepted[chosen]
+    hull, connected_hull = selected.hull, selected.bridged
+    optimized_sources, target_sources = selected.edited, selected.targets
+    edited_comparison = optimized_sources if optimized_sources[0].image.shape == image_size else None
+    selected_setup = _setup_description(target_sources)
+    log(f"[STL] selected {selected.name}")
+    if len(target_sources) > 1:
+        for i, src in enumerate(optimized_sources):
+            save_mask(src.image, str(debug_dir / "masks" / "opt" / f"view{i}_optimized_mask.png"))
+    alternatives = set(tradeoff_options(measured, chosen))
+    alternatives.update(i for i, option in enumerate(accepted) if option.adjusted_setup and i != chosen)
+    if untrimmed is not None:
+        alternatives.add(untrimmed)
+    for i in sorted(alternatives):
+        alternative = accepted[i]
+        path = mesh_dir / f"alternative_{i + 1}.stl"
+        meshes[i].export(path)
+        measured[i]["stl_path"] = str(path)
+        measured[i]["setup"] = _setup_description(alternative.targets)
+        alternative_sim = output_dir / "candidates" / f"alternative_{i + 1}"
+        simulate_and_save(alternative.hull, voxel_centers, alternative.targets,
+                          out_dir=str(alternative_sim), prefix="hull",
+                          triangles=mesh_triangles_in_world(meshes[i], world_size, pitch))
+        measured[i]["sim_dir"] = str(alternative_sim)
+    quality = {"selected": chosen, "candidates": measured, "selected_setup": selected_setup,
+               "setup_search": setup_search, "selected_adjusted_setup": selected.adjusted_setup,
+               "print_cleanup": cleanup}
 
-    log(f"[PIPELINE] fast prune bulk removed: {post_stats['bulk_removed']}")
-    log(f"[PIPELINE] fast prune cc removed: {post_stats['cc_removed']}")
-    log(f"[PIPELINE] fast prune final hull voxel count: {post_stats['final_voxels']}")
-
-    log("[PIPELINE] simulating shadows...")
-    hull_summaries = simulate_and_save(
-        hull,
-        voxel_centers,
-        sources,
-        out_dir=str(sim_dir),
-        prefix="hull",
-    )
-
-    pitch = voxel_pitch(world_size, nx, ny, nz)
-
+    for i, src in enumerate(target_sources):
+        strict_actual = render_shadow(strict, voxel_centers, original_sources[i])
+        hull_actual = render_shadow(hull, voxel_centers, src)
+        bridged_actual = render_shadow(connected_hull, voxel_centers, src)
+        fit["views"][i].update(
+            lost_from_strict_hull=int((src.image & strict_actual & ~hull_actual).sum()),
+            lost_at_connectivity_cleanup=int((src.image & bridged_actual & ~hull_actual).sum()),
+        )
+    (output_dir / "fit_diagnostics.json").write_text(json.dumps(fit, indent=2), encoding="utf-8")
     hull_stl_path = str(mesh_dir / "shadow_hull.stl")
 
     log("[PIPELINE] exporting STL...")
-    export_voxels_to_stl(hull, pitch, hull_stl_path)
+    mesh = meshes[chosen]
+    mesh.export(hull_stl_path)
     log(f"[PIPELINE] saved raw hull mesh: {hull_stl_path}")
+    hull_summaries = simulate_and_save(
+        hull, voxel_centers, target_sources, out_dir=str(sim_dir), prefix="hull",
+        triangles=mesh_triangles_in_world(mesh, world_size, pitch), edited_sources=edited_comparison,
+        area_dir=str(output_dir / "sim_area") if rank_stl else None,
+    )
 
     carved_stl_path = None
+    carved_summaries = None
 
     if optimize_material:
         log("[PIPELINE] carving material...")
-        carved, carve_stats = carve_hollow_shell_strict(
+        carved, _ = carve_hollow_shell_strict(
             hull,
             voxel_centers,
-            sources,
+            target_sources,
             shell_thickness_voxels=2,
             max_passes=4,
             random_seed=0,
@@ -273,46 +450,82 @@ def run_pipeline(
             verbose=True,
         )
 
-        log(f"[PIPELINE] carved sculpture voxels: {int(carved.sum())}")
+        carved_mesh = mesh
+        carved_count = int(carved.sum())
+        if connected_components_3d(carved)[1] != 1:
+            log("[PIPELINE] hollowing would break face connectivity; keeping the solid sculpture")
+            carved = hull
+        elif carved_count < hull.sum():
+            hollow = SculptureCandidate("Hollow hull", carved, connected_hull, target_sources,
+                                        optimized_sources, selected.pruning, selected.adjusted_setup)
+            hollow_metrics, hollow_mesh = measure_candidate(hollow, world_size, pitch, fine_sampling=rank_stl)
+            solid_metrics = measured[chosen]
+            keep_hollow = (hollow_metrics["mean_iou"] >= solid_metrics["mean_iou"] - .005
+                           and hollow_metrics["mean_area_iou"] >= solid_metrics["mean_area_iou"] - .005
+                           and hollow_metrics["score"] >= solid_metrics["score"] - .005)
+            if keep_hollow and cleanup["applied"]:
+                before = mesh_shadows(mesh, target_sources, world_size, pitch)
+                after = mesh_shadows(hollow_mesh, target_sources, world_size, pitch)
+                keep_hollow = not any(mask.any() for mask in shadow_regressions(before, after, target_sources))
+            quality["hollow"] = {"accepted": keep_hollow, "metrics": hollow_metrics}
+            if keep_hollow:
+                carved_mesh = hollow_mesh
+            else:
+                log("[PIPELINE] hollowing reduced STL shadow fidelity; keeping the solid sculpture")
+                carved = hull
+        carved_count = int(carved.sum())
+        hull_count = int(hull.sum())
+        log(f"[PIPELINE] carved sculpture voxels: {carved_count}")
         log(f"[PIPELINE] carved sculpture occupancy ratio: {float(carved.mean())}")
-        log(f"[PIPELINE] carved sculpture voxels removed: {carve_stats['removed']}")
-        log(f"[PIPELINE] carved sculpture reduction ratio: {carve_stats['reduction_ratio']}")
-
-        simulate_and_save(
-            carved,
-            voxel_centers,
-            sources,
-            out_dir="outputs/sim",
-            prefix="carved",
-        )
+        log(f"[PIPELINE] carved sculpture voxels removed: {hull_count - carved_count}")
+        log(f"[PIPELINE] carved sculpture reduction ratio: {1 - carved_count / hull_count}")
 
         save_voxel_slices(hull, str(debug_dir / "slices"), "hull")
         save_voxel_slices(carved, str(debug_dir / "slices"), "carved")
 
         carved_stl_path = str(mesh_dir / "shadow_carved.stl")
-        export_voxels_to_stl(carved, pitch, carved_stl_path)
+        carved_mesh.export(carved_stl_path)
+        carved_summaries = simulate_and_save(
+            carved, voxel_centers, target_sources, out_dir=str(sim_dir), prefix="carved",
+            triangles=mesh_triangles_in_world(carved_mesh, world_size, pitch), edited_sources=edited_comparison,
+            area_dir=str(output_dir / "sim_area") if rank_stl else None,
+        )
         log(f"[PIPELINE] saved carved mesh: {carved_stl_path}")
 
+    (output_dir / "candidate_quality.json").write_text(json.dumps(quality, indent=2), encoding="utf-8")
     log(f"[PIPELINE] completed in {time.time() - t0:.2f} seconds")
 
     return {
         "output_dir": str(output_dir),
+        "world_size": world_size,
+        "voxel_pitch": pitch,
         "hull_stl_path": hull_stl_path,
         "carved_stl_path": carved_stl_path,
         "hull_summaries": hull_summaries,
+        "carved_summaries": carved_summaries,
+        "fit_diagnostics": fit,
+        "candidate_quality": quality,
     }
 
 
 def main():
     args = parse_args()
 
-    run_pipeline(
+    result = run_pipeline(
         view_paths=args.views,
         world_size=args.world_size,
         grid=args.grid,
         image_size_value=args.image_size,
         optimize_material=args.optimize_material,
+        directions=parse_direction_string(args.directions) if args.directions else None,
+        opt_iters=args.opt_iters, threshold=args.threshold,
+        close_iters=args.close_iters, open_iters=args.open_iters, dilate_iters=args.dilate_iters,
+        rank_stl=not args.center_ranking, search_alignment=args.search_alignment,
+        search_light_angles=args.search_light_angles, bridge_diameter_voxels=args.bridge_diameter_voxels,
+        print_cleanup=not args.no_print_cleanup,
     )
+    print_view_metrics("STL shadows against original silhouettes",
+                       result["carved_summaries"] or result["hull_summaries"])
 
 
 if __name__ == "__main__":

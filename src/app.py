@@ -40,17 +40,19 @@ class StreamlitLogCapture:
             self.log_func(self.buffer.strip())
             self.buffer = ""
             
-def show_stl_preview(stl_path):
+def show_stl_preview(stl_path, shadow_images, world_size, voxel_pitch):
     with tempfile.TemporaryDirectory() as tmpdir:
         output_path = str(Path(tmpdir) / "preview.png")
         render_shadow_preview(
             stl_path=stl_path,
             output_path=output_path,
-            shadow_images=[],
+            shadow_images=shadow_images,
+            world_size=world_size,
+            voxel_pitch=voxel_pitch,
         )
         st.image(output_path, use_container_width=True)
 
-def show_shadow_stats(hull_summaries):
+def show_shadow_stats(hull_summaries, fit_diagnostics=None):
     if not hull_summaries:
         st.info("No shadow stats available.")
         return
@@ -68,13 +70,21 @@ def show_shadow_stats(hull_summaries):
                     padding:10px;
                     background:#151922;
                 ">
-                    <div><b>Accuracy:</b> {m['iou'] * 100:.2f}%</div>
+                    <div><b>Original mask IoU:</b> {m['iou'] * 100:.2f}%</div>
                     <div><b>Missing:</b> {m['missing_pixels']}</div>
                     <div><b>Extra:</b> {m['extra_pixels']}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+            if m.get("optimizer_added_pixels"):
+                st.caption(f"Edited mask IoU {m['edited_target_iou']:.1%} · "
+                           f"{m['optimizer_added_pixels']:,} pixels added")
+            if fit_diagnostics:
+                view = fit_diagnostics["views"][i]
+                st.caption(f"{view['no_center_ray']:,} target pixels without a voxel-center ray · "
+                           f"{view['blocked_by_other_views']:,} blocked by the other views · "
+                           f"{view['lost_at_connectivity_cleanup']:,} lost during connectivity cleanup")
 
 
 def preview_uploaded_image_return(uploaded_file, image_size=250, threshold=128, invert=False):
@@ -373,19 +383,28 @@ def show_results(result, optimize_material):
     )
 
     sim_dir = Path(result["output_dir"]) / "sim"
+    show_carved = optimize_material and result["carved_stl_path"]
+    prefix = "carved" if show_carved else "hull"
+    quality = result.get("candidate_quality")
 
     st.subheader("3. Preview")
 
     preview_col, info_col = st.columns([1.1, 1])
 
     with preview_col:
-        show_stl_preview(
-            final_stl_path
-        )
+        actual_images = sorted(sim_dir.glob(f"{prefix}_view*_actual.png"), key=get_view_number)
+        if quality and quality["selected_adjusted_setup"]:
+            actual_images = []
+        show_stl_preview(final_stl_path, actual_images, result.get("world_size"), result.get("voxel_pitch"))
 
     with info_col:
         st.markdown("### Result Stats")
-        show_shadow_stats(result.get("hull_summaries"))
+        summaries = result.get("carved_summaries") if show_carved else result.get("hull_summaries")
+        fit = result.get("fit_diagnostics")
+        if fit:
+            for first, second in fit.get("disjoint_view_pairs", []):
+                st.caption(f"Views {first} and {second} shared no voxel volume before setup or mask adjustments.")
+        show_shadow_stats(summaries, fit)
 
         st.markdown("### Download")
 
@@ -398,10 +417,63 @@ def show_results(result, optimize_material):
                 type="primary",
             )
 
+    if quality:
+        with st.expander("Compare sculpture candidates"):
+            selected = quality["selected"]
+            items = quality["candidates"]
+            rows = [{
+                "Candidate": item["name"], "Selected hull": i == selected,
+                "Mean IoU": f"{item['mean_iou']:.1%}", "Worst view": f"{item['worst_iou']:.1%}",
+                "Sampled area IoU": f"{item['mean_area_iou']:.1%}" if "mean_area_iou" in item else "—",
+                "Mesh volume (mm³)": round(item["mesh_volume"], 3),
+                "Connected core width (mm)": round(item["connected_core_width"], 3),
+                "Y-up unsupported voxels": item.get("unsupported_voxels_y_up", "—"),
+            } for i, item in enumerate(items)]
+            st.table(rows)
+            st.caption("Core width is a voxel erosion estimate, capped at seven voxels. "
+                       "Unsupported voxels are a Y-up overhang proxy. Confirm supports in your slicer.")
+            cleanup = quality.get("print_cleanup", {})
+            if cleanup.get("applied"):
+                st.caption(f"Print cleanup removed {cleanup['removed_voxels']:,} voxels and "
+                           f"{sum(cleanup['removed_extra_pixels']):,} extra shadow pixels while "
+                           "preserving the selected hull's target coverage.")
+            search = quality.get("setup_search")
+            if search:
+                st.caption(f"Coarse setup coverage {search['coarse_before']:.1%} → "
+                           f"{search['coarse_after']:.1%}. "
+                           f"Selected setup: {'adjusted' if quality['selected_adjusted_setup'] else 'original'}.")
+                st.table([{
+                    "View": i + 1, "Horizontal": f"{view['horizontal']:.0%}",
+                    "Vertical": f"{view['vertical']:.0%}", "Frame scale": f"{view['scale']:.0%}",
+                    "Yaw": f"{view['yaw']}°", "Pitch": f"{view['pitch']}°",
+                } for i, view in enumerate(search["views"])])
+            st.download_button("Download candidate metrics and light setup",
+                               (Path(result["output_dir"]) / "candidate_quality.json").read_bytes(),
+                               file_name="candidate_quality.json", mime="application/json")
+            alternates = {item["name"]: item for item in items if item.get("sim_dir")}
+            if alternates:
+                name = st.selectbox("Alternate shadow preview", list(alternates))
+                paths = sorted(Path(alternates[name]["sim_dir"]).glob("hull_view*_actual.png"), key=get_view_number)
+                for i, (column, path) in enumerate(zip(st.columns(len(paths)), paths)):
+                    column.image(str(path), caption=f"View {i + 1}")
+            for i, item in enumerate(items):
+                if item.get("stl_path"):
+                    path = Path(item["stl_path"])
+                    st.download_button(f"Download {item['name']}", path.read_bytes(),
+                                       file_name=path.name, key=f"candidate_stl_{i}")
+
     st.subheader("4. Output previews")
 
+    area_images = sorted((sim_dir.parent / "sim_area").glob(f"{prefix}_view*_comparison.png"),
+                         key=get_view_number)
+    if area_images:
+        with st.expander("Finer shadow comparison"):
+            st.caption("Each target pixel is sampled at four points. Red marks missing shadow and blue marks extra shadow.")
+            for column, path, summary in zip(st.columns(len(area_images)), area_images, summaries):
+                column.image(str(path), caption=f"View {get_view_number(path)} · {summary['area_iou']:.1%} area IoU")
+
     if sim_dir.exists():
-        sim_images = list(sim_dir.glob("*.png"))
+        sim_images = list(sim_dir.glob(f"{prefix}_*.png"))
 
         if sim_images:
             grouped = {}
@@ -424,7 +496,7 @@ def show_results(result, optimize_material):
                         if "target" in name:
                             caption = "Target Silhouette (Input)"
                         elif "actual" in name:
-                            caption = "Rendered Silhouette"
+                            caption = "Exported STL Shadow"
                         elif "comparison" in name:
                             caption = "Comparison to Target"
                         elif "missing" in name:
@@ -508,6 +580,16 @@ with st.sidebar:
         value=False,
         help="Removes unnecessary interior voxels to create a hollow structure. Reduces material usage but increases processing time.",
     )
+    with st.expander("Candidate search"):
+        print_cleanup = st.checkbox("Trim thin features for printing", value=True,
+                                   help="Remove thin material when the sculpture stays connected and its STL shadows keep all correct detail.")
+        search_alignment = st.checkbox("Search silhouette alignment",
+                                       help="Allow small offsets and frame scale changes after the first view.")
+        search_light_angles = st.checkbox("Search light angles",
+                                          help="Enable when the installation can use different light directions.")
+        bridge_diameter_voxels = st.selectbox("Alternate bridge diameter", (1, 3, 5), index=1,
+                                              format_func=lambda value: f"{value} voxel" + ("s" if value > 1 else ""),
+                                              help="Generate an alternate route with this width when possible.")
 
 st.subheader("1. Choose silhouettes")
 
@@ -596,6 +678,10 @@ if run_clicked:
                         image_size_value=image_size,
                         optimize_material=optimize_material,
                         prune_passes=prune_passes,
+                        search_alignment=search_alignment,
+                        search_light_angles=search_light_angles,
+                        bridge_diameter_voxels=bridge_diameter_voxels,
+                        print_cleanup=print_cleanup,
                         log=ui_log,
                     )
 
