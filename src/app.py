@@ -436,7 +436,15 @@ def show_results(result, optimize_material):
             if cleanup.get("applied"):
                 st.caption(f"Print cleanup removed {cleanup['removed_voxels']:,} voxels and "
                            f"{sum(cleanup['removed_extra_pixels']):,} extra shadow pixels while "
-                           "preserving the selected hull's target coverage.")
+                           "preserving target coverage during that pass.")
+            branch_cleanup = quality.get("branch_trim_cleanup", {})
+            if branch_cleanup.get("applied"):
+                st.caption(f"Branch cleanup removed {branch_cleanup['removed_voxels']:,} voxels and added "
+                           f"{branch_cleanup['added_voxels']:,}. Thin voxels "
+                           f"{branch_cleanup['thin_voxels_before']:,} → {branch_cleanup['thin_voxels_after']:,}. "
+                           "The preceding STL is available below.")
+            elif branch_cleanup.get("enabled"):
+                st.caption("Branch cleanup found no improvement within the shadow and geometry limits.")
             search = quality.get("setup_search")
             if search:
                 st.caption(f"Coarse setup coverage {search['coarse_before']:.1%} → "
@@ -583,6 +591,12 @@ with st.sidebar:
     with st.expander("Candidate search"):
         print_cleanup = st.checkbox("Trim thin features for printing", value=True,
                                    help="Remove thin material when the sculpture stays connected and its STL shadows keep all correct detail.")
+        branch_trim_cleanup = st.checkbox(
+            "Clean up branches and small gaps",
+            disabled=not print_cleanup,
+            help="Try trimming whole fragile branches and filling small gaps after print cleanup. "
+                 "Allows up to one percentage point of sampled shadow overlap loss per view.",
+        )
         search_alignment = st.checkbox("Search silhouette alignment",
                                        help="Allow small offsets and frame scale changes after the first view.")
         search_light_angles = st.checkbox("Search light angles",
@@ -682,6 +696,7 @@ if run_clicked:
                         search_light_angles=search_light_angles,
                         bridge_diameter_voxels=bridge_diameter_voxels,
                         print_cleanup=print_cleanup,
+                        branch_trim_cleanup=branch_trim_cleanup,
                         log=ui_log,
                     )
 

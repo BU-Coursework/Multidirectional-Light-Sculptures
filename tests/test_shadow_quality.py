@@ -10,12 +10,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from compare_physical_shadow import register_photo
+from branch_cleanup import _too_many_local_errors, clean_branches
 from export_mesh import mesh_from_voxels
 from light_setup import search_light_setup
 from optimize_consistency import optimize_silhouettes
 from postprocess_prune import fast_projection_prune
 from print_cleanup import mesh_shadows, shadow_regressions, trim_for_print
-from quality_candidates import connected_core_width, select_candidate, tradeoff_options
+from quality_candidates import SculptureCandidate, connected_core_width, measure_candidate, select_candidate, tradeoff_options
 from render import doubled_shadow_source, render_mesh_shadow, render_shadow
 from run_pipeline import assess_strict_hull, run_pipeline
 from shadow_hull import compute_shadow_hull, connected_components_3d
@@ -124,6 +125,7 @@ class ShadowQualityTests(unittest.TestCase):
             preview = np.asarray(Image.open(directory / "sim" / "hull_view0_target.png")) > 127
             np.testing.assert_array_equal(preview, mask)
             quality = result["candidate_quality"]
+            self.assertFalse(quality["branch_trim_cleanup"]["enabled"])
             self.assertAlmostEqual(quality["candidates"][quality["selected"]]["mean_iou"], scores["iou"])
             self.assertAlmostEqual(quality["candidates"][quality["selected"]]["mean_area_iou"], scores["area_iou"])
             self.assertTrue((directory / "sim_area" / "hull_view0_comparison.png").is_file())
@@ -207,6 +209,62 @@ class ShadowQualityTests(unittest.TestCase):
         hull[8:15, 8, 8] = True
         sources = build_sources([hull.any(axis=0)[::-1, ::-1]], size)
         self.assertIsNone(trim_for_print(hull, centers, sources, mesh_from_voxels(hull, 1), size, 1))
+
+    def test_branch_cleanup_trims_a_terminal_branch_and_fills_a_hidden_pit(self):
+        size = 20
+        centers = make_voxel_centers(size, size, size, size)
+        hull = np.zeros((size, size, size), dtype=bool)
+        hull[7:15, 5:13, 5:13] = True
+        hull[2:7, 8, 8] = True
+        hull[14, 10, 10] = False
+        sources = build_sources([hull.any(axis=0)[::-1, ::-1]], size)
+        candidate = SculptureCandidate("Baseline", hull, hull, sources, sources, {})
+        metrics, mesh = measure_candidate(candidate, size, 1)
+
+        cleaned, _, cleaned_mesh, stats = clean_branches(candidate, centers, mesh, metrics, size, 1)
+
+        self.assertEqual(stats["removed_voxels"], 5)
+        self.assertEqual(stats["added_voxels"], 1)
+        self.assertTrue(cleaned.hull[14, 10, 10])
+        self.assertTrue(cleaned_mesh.is_watertight)
+        self.assertEqual(cleaned_mesh.body_count, 1)
+        np.testing.assert_array_equal(mesh_shadows(cleaned_mesh, sources, size, 1),
+                                      mesh_shadows(mesh, sources, size, 1))
+
+    def test_branch_cleanup_leaves_a_visible_branch_when_shadow_loss_is_too_large(self):
+        size = 20
+        centers = make_voxel_centers(size, size, size, size)
+        hull = np.zeros((size, size, size), dtype=bool)
+        hull[7:15, 5:13, 5:13] = True
+        hull[1:7, 8, 8] = True
+        mesh = mesh_from_voxels(hull, 1)
+        sources = build_sources([np.zeros((size, size), dtype=bool)], size, directions=[(0, 0, 1)])
+        sources[0].image, = mesh_shadows(mesh, sources, size, 1)
+        candidate = SculptureCandidate("Baseline", hull, hull, sources, sources, {})
+        metrics, mesh = measure_candidate(candidate, size, 1, mesh=mesh)
+
+        self.assertIsNone(clean_branches(candidate, centers, mesh, metrics, size, 1))
+
+    def test_branch_cleanup_detail_limit_protects_local_features(self):
+        errors = np.zeros((48, 48), dtype=bool)
+        errors[3, 2:6] = True
+        errors[31, 36:40] = True
+        self.assertFalse(_too_many_local_errors(errors))
+        errors[3, 6] = True
+        self.assertTrue(_too_many_local_errors(errors))
+
+    def test_branch_cleanup_keeps_a_thin_connection_between_solid_regions(self):
+        size = 24
+        centers = make_voxel_centers(size, size, size, size)
+        hull = np.zeros((size, size, size), dtype=bool)
+        hull[2:8, 5:13, 5:13] = True
+        hull[15:22, 5:13, 5:13] = True
+        hull[8:15, 8, 8] = True
+        sources = build_sources([hull.any(axis=0)[::-1, ::-1]], size)
+        candidate = SculptureCandidate("Baseline", hull, hull, sources, sources, {})
+        metrics, mesh = measure_candidate(candidate, size, 1)
+
+        self.assertIsNone(clean_branches(candidate, centers, mesh, metrics, size, 1))
 
     def test_stl_guard_detects_shadow_moves_even_when_pixel_counts_match(self):
         target = np.array([[True, True], [False, False]])

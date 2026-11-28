@@ -197,6 +197,8 @@ Add `--search-alignment` to try small frame offsets and scale changes. Add `--se
 
 Print cleanup runs by default after STL candidate selection. It trims thin features and restores connections or shadow coverage as needed. It keeps a trim only when the resulting STL stays connected and watertight, preserves every previously correct target pixel, adds no new off-target shadow, and preserves the core-width estimate. The untrimmed candidate remains available for comparison. Use `--no-print-cleanup` or clear **Trim thin features for printing** to bypass it. Check the selected STL in your slicer at the intended physical scale to evaluate overhangs and supports.
 
+Enable **Clean up branches and small gaps** in the app or pass `--branch-trim-cleanup` to try a second cleanup pass. It ranks small terminal branches by their shadow contribution and tests fills in narrow gaps. It checks the resulting STL against the preceding candidate in every view, with a maximum loss of one percentage point in sampled shadow overlap and additional checks for fine detail, enclosed openings, and major weak connections. The app and `candidate_quality.json` report the accepted edits, and the preceding STL is available for comparison.
+
 Run the generated holdouts from the repository root.
 
 ```bash

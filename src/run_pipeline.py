@@ -17,6 +17,7 @@ from debug_slices import save_voxel_slices
 from optimize_consistency import optimize_silhouettes
 from postprocess_prune import fast_projection_prune
 from print_cleanup import mesh_shadows, shadow_regressions, trim_for_print
+from branch_cleanup import clean_branches, preserves_branch_cleanup
 from light_setup import search_light_setup
 from quality_candidates import (
     SculptureCandidate, footprint_sampled_masks, measure_candidate, select_candidate, tradeoff_options,
@@ -152,8 +153,11 @@ def parse_args():
                         help="Try bounded light angle changes for views after the first")
     parser.add_argument("--bridge-diameter-voxels", type=int, choices=(1, 3, 5), default=3,
                         help="Diameter of the optional thicker-bridge candidate")
-    parser.add_argument("--no-print-cleanup", action="store_true",
-                        help="Keep the selected hull without trimming thin geometry")
+    cleanup_options = parser.add_mutually_exclusive_group()
+    cleanup_options.add_argument("--no-print-cleanup", action="store_true",
+                                 help="Keep the selected hull without print cleanup")
+    cleanup_options.add_argument("--branch-trim-cleanup", action="store_true",
+                                 help="Try additional branch trimming and local filling within STL shadow limits")
 
     args = parser.parse_args()
 
@@ -161,6 +165,8 @@ def parse_args():
         parser.error("Please provide one to three silhouette images.")
     if args.center_ranking and (args.search_alignment or args.search_light_angles):
         parser.error("Setup search requires STL candidate ranking.")
+    if args.center_ranking and args.branch_trim_cleanup:
+        parser.error("Branch trim cleanup requires STL candidate ranking.")
 
     return args
 
@@ -226,6 +232,7 @@ def run_pipeline(
     search_light_angles=False,
     bridge_diameter_voxels=3,
     print_cleanup=True,
+    branch_trim_cleanup=False,
 ):
     t0 = time.time()
 
@@ -361,6 +368,7 @@ def run_pipeline(
                          "Check their alignment and light directions.")
     chosen = select_candidate(measured)
     cleanup = {"enabled": rank_stl and print_cleanup, "applied": False}
+    branch_cleanup = {"enabled": cleanup["enabled"] and branch_trim_cleanup, "applied": False}
     untrimmed = None
     if cleanup["enabled"]:
         base = accepted[chosen]
@@ -383,6 +391,20 @@ def run_pipeline(
                 log(f"[PRINT] removed {stats['removed_voxels']:,} voxels with STL shadow protection")
         if not cleanup["applied"]:
             log("[PRINT] kept the selected geometry after cleanup checks")
+    if branch_cleanup["enabled"]:
+        refined = clean_branches(accepted[chosen], voxel_centers, meshes[chosen], measured[chosen],
+                                 world_size, pitch)
+        if refined is not None:
+            candidate, metrics, mesh, stats = refined
+            branch_cleanup.update(stats, applied=True, original_candidate=chosen)
+            chosen = len(accepted)
+            accepted.append(candidate)
+            measured.append(metrics)
+            meshes.append(mesh)
+            log(f"[PRINT] branch cleanup removed {stats['removed_voxels']:,} voxels "
+                f"and filled {stats['added_voxels']:,} vacancies")
+        else:
+            log("[PRINT] kept the selected geometry after branch cleanup checks")
     selected = accepted[chosen]
     hull, connected_hull = selected.hull, selected.bridged
     optimized_sources, target_sources = selected.edited, selected.targets
@@ -396,6 +418,8 @@ def run_pipeline(
     alternatives.update(i for i, option in enumerate(accepted) if option.adjusted_setup and i != chosen)
     if untrimmed is not None:
         alternatives.add(untrimmed)
+    if branch_cleanup["applied"]:
+        alternatives.add(branch_cleanup["original_candidate"])
     for i in sorted(alternatives):
         alternative = accepted[i]
         path = mesh_dir / f"alternative_{i + 1}.stl"
@@ -409,7 +433,7 @@ def run_pipeline(
         measured[i]["sim_dir"] = str(alternative_sim)
     quality = {"selected": chosen, "candidates": measured, "selected_setup": selected_setup,
                "setup_search": setup_search, "selected_adjusted_setup": selected.adjusted_setup,
-               "print_cleanup": cleanup}
+               "print_cleanup": cleanup, "branch_trim_cleanup": branch_cleanup}
 
     for i, src in enumerate(target_sources):
         strict_actual = render_shadow(strict, voxel_centers, original_sources[i])
@@ -463,15 +487,19 @@ def run_pipeline(
             keep_hollow = (hollow_metrics["mean_iou"] >= solid_metrics["mean_iou"] - .005
                            and hollow_metrics["mean_area_iou"] >= solid_metrics["mean_area_iou"] - .005
                            and hollow_metrics["score"] >= solid_metrics["score"] - .005)
-            if keep_hollow and cleanup["applied"]:
+            if keep_hollow and (cleanup["applied"] or branch_cleanup["applied"]):
                 before = mesh_shadows(mesh, target_sources, world_size, pitch)
                 after = mesh_shadows(hollow_mesh, target_sources, world_size, pitch)
                 keep_hollow = not any(mask.any() for mask in shadow_regressions(before, after, target_sources))
+            if keep_hollow and branch_cleanup["applied"]:
+                keep_hollow = (hollow_mesh.is_watertight and hollow_mesh.body_count == 1
+                               and hollow_metrics["connected_core_width"] >= solid_metrics["connected_core_width"]
+                               and preserves_branch_cleanup(hull, carved))
             quality["hollow"] = {"accepted": keep_hollow, "metrics": hollow_metrics}
             if keep_hollow:
                 carved_mesh = hollow_mesh
             else:
-                log("[PIPELINE] hollowing reduced STL shadow fidelity; keeping the solid sculpture")
+                log("[PIPELINE] hollowing did not pass the shadow and geometry checks; keeping the solid sculpture")
                 carved = hull
         carved_count = int(carved.sum())
         hull_count = int(hull.sum())
@@ -523,6 +551,7 @@ def main():
         rank_stl=not args.center_ranking, search_alignment=args.search_alignment,
         search_light_angles=args.search_light_angles, bridge_diameter_voxels=args.bridge_diameter_voxels,
         print_cleanup=not args.no_print_cleanup,
+        branch_trim_cleanup=args.branch_trim_cleanup,
     )
     print_view_metrics("STL shadows against original silhouettes",
                        result["carved_summaries"] or result["hull_summaries"])
